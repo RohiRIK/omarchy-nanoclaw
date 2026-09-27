@@ -99,6 +99,56 @@ run remove app --yes
 rm -f "$D"; run install app --yes; run remove app --yes
 [[ ! -e $D ]] && pass "app: an untouched entry of ours is removed" || fail "app: our entry was left behind"
 
+# --- review: never follow a symlink at the desktop path -----------------------
+rm -f "$D"
+BAIT="$T/bait-nowhere"
+ln -s "$BAIT" "$D"
+run install app --yes
+[[ -L $D && $(readlink "$D") == "$BAIT" ]] && pass "app: dangling symlink at desktop path is left alone" \
+  || fail "app: replaced or removed the dangling symlink"
+[[ ! -e $BAIT ]] && pass "app: dangling symlink write-through did not create the target" \
+  || fail "app: wrote through the dangling symlink"
+grep -q "symlink" "$T/out" && pass "app: dangling symlink skip is explained" || fail "app: no symlink skip message"
+run remove app --yes
+[[ -L $D ]] && pass "app: remove leaves a dangling symlink alone" || fail "app: remove deleted the dangling symlink"
+
+rm -f "$D"
+BAIT="$T/bait-live"; printf 'BAIT_CONTENT_UNTOUCHED\n' >"$BAIT"
+ln -s "$BAIT" "$D"
+run install app --yes
+[[ $(cat "$BAIT") == "BAIT_CONTENT_UNTOUCHED" ]] && pass "app: live symlink target is not overwritten" \
+  || fail "app: wrote through a live symlink into the bait file"
+[[ -L $D && $(readlink "$D") == "$BAIT" ]] && pass "app: live symlink at desktop path is left alone" \
+  || fail "app: replaced the live symlink"
+run remove app --yes
+[[ -L $D && -f $BAIT && $(cat "$BAIT") == "BAIT_CONTENT_UNTOUCHED" ]] \
+  && pass "app: remove does not follow a live symlink" || fail "app: remove followed or deleted through the symlink"
+
+# Symlink whose target looks like ours (marker + matching sha) still must not count as ours.
+rm -f "$D" "$BAIT"
+run install app --yes
+cp -p "$D" "$T/forged-target"
+sha="$(sha256sum "$D" | cut -d' ' -f1)"
+rm -f "$D"
+ln -s "$T/forged-target" "$D"
+run install app --yes
+[[ $(sha256sum "$T/forged-target" | cut -d' ' -f1) == "$sha" ]] \
+  && pass "app: forged symlink-to-ours target is not rewritten on reinstall" \
+  || fail "app: reinstall wrote through a symlink that pointed at our content"
+[[ -L $D ]] && pass "app: forged ownership via symlink is refused" || fail "app: replaced forged symlink with a file"
+run remove app --yes
+[[ -L $D && -f $T/forged-target ]] && pass "app: remove refuses a symlink even when target looks like ours" \
+  || fail "app: remove followed a symlink that looked like ours"
+
+# Happy path still creates a regular file after clearing the symlink.
+rm -f "$D"
+run install app --yes
+[[ -f $D && ! -L $D ]] && grep -q "X-Rohirik-Nanoclaw-Managed=true" "$D" \
+  && pass "app: after clearing a symlink, a regular managed entry is written" \
+  || fail "app: failed to write a regular desktop entry"
+run remove app --yes
+[[ ! -e $D ]] && pass "app: regular managed entry still removes cleanly" || fail "app: regular remove broken"
+
 echo
 [[ $RC -eq 0 ]] && echo "ALL ASSERTIONS PASSED" || echo "ASSERTION FAILURES"
 exit $RC

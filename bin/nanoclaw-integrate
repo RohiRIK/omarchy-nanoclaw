@@ -140,24 +140,62 @@ remove_agent() {
   unrecord agent; ok "Keybinding and alias restored"
 }
 
-# The desktop entry is ours only if it carries our marker and still matches
-# the checksum recorded when we wrote it; anything else is the user's file.
+# The desktop entry is ours only if it is a regular file (never a symlink),
+# carries our marker, and still matches the checksum recorded when we wrote it.
 desktop_ours() {
+  [[ -L $DESKTOP ]] && return 1
   [[ -f $DESKTOP ]] && grep -qxF "X-Rohirik-Nanoclaw-Managed=true" "$DESKTOP" \
     && grep -qxF "app-sha:$(sha256sum "$DESKTOP" | cut -d' ' -f1)" "$STATE" 2>/dev/null
+}
+
+# Write $DESKTOP via a same-dir temp + mv so we never follow a symlink at that path.
+# Caller must already have decided the path is writable (absent, or desktop_ours).
+write_desktop() { # content on stdin
+  local dir tmp
+  dir="$(dirname "$DESKTOP")"
+  mkdir -p "$dir"
+  # Refuse symlink at the name (dangling or live). mv -f would replace the entry,
+  # but a planted link must never become "our" desktop file.
+  if [[ -L $DESKTOP ]]; then
+    say "Skipped $DESKTOP: it is a symlink (refusing to follow). Remove it to let NanoClaw write one."
+    return 1
+  fi
+  # Foreign regular file (no managed marker): leave it alone.
+  if [[ -e $DESKTOP ]] && ! grep -qxF "X-Rohirik-Nanoclaw-Managed=true" "$DESKTOP" 2>/dev/null; then
+    say "Skipped $DESKTOP: it exists and is yours (or you changed it). Remove it to let NanoClaw write one."
+    return 1
+  fi
+  tmp=$(mktemp "$dir/.$ID.desktop.XXXXXX") || return 1
+  cat >"$tmp" || { rm -f "$tmp"; return 1; }
+  # TOCTOU re-check after writing the temp.
+  if [[ -L $DESKTOP ]]; then
+    rm -f "$tmp"
+    say "Skipped $DESKTOP: it is a symlink (refusing to follow). Remove it to let NanoClaw write one."
+    return 1
+  fi
+  if [[ -e $DESKTOP ]] && ! grep -qxF "X-Rohirik-Nanoclaw-Managed=true" "$DESKTOP" 2>/dev/null; then
+    rm -f "$tmp"
+    say "Skipped $DESKTOP: it exists and is yours (or you changed it). Remove it to let NanoClaw write one."
+    return 1
+  fi
+  mv -f "$tmp" "$DESKTOP"
 }
 
 install_app() {
   ask "Add NanoClaw to Apps and the app launcher?" || return 0
   local t="omarchy-launch-floating-terminal-with-presentation"
+  if [[ -L $DESKTOP ]]; then
+    say "Skipped $DESKTOP: it is a symlink (refusing to follow). Remove it to let NanoClaw write one."
+    return 0
+  fi
   if [[ -e $DESKTOP ]] && ! desktop_ours; then
     say "Skipped $DESKTOP: it exists and is yours (or you changed it). Remove it to let NanoClaw write one."
     return 0
   fi
   link "$PLUGIN_DIR/assets/nanoclaw-app.png" "$ICON" || return 1
-  mkdir -p "$(dirname "$DESKTOP")"
+  # Drop the previous checksum only after the gate above accepted this path.
   grep -v '^app-sha:' "$STATE" 2>/dev/null >"$STATE.tmp"; mv -f "$STATE.tmp" "$STATE" 2>/dev/null
-  cat >"$DESKTOP" <<EOF
+  write_desktop <<EOF || return 0
 [Desktop Entry]
 Type=Application
 Name=NanoClaw
@@ -189,8 +227,11 @@ EOF
   record app; ok "App entry: NanoClaw in Apps"
 }
 remove_app() {
+  # Symlinks are never "ours"; leave them alone (do not follow into a foreign target).
   if desktop_ours; then
     rm -f "$DESKTOP"
+  elif [[ -L $DESKTOP ]]; then
+    say "Kept $DESKTOP: it is a symlink (not ours)."
   elif [[ -e $DESKTOP ]]; then
     say "Kept $DESKTOP: it was changed after NanoClaw wrote it."
   fi
