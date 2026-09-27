@@ -153,7 +153,7 @@ NanoClaw itself as well, use its own uninstaller:
 ## Development
 
 ```bash
-for t in tests/*.sh; do bash "$t" || echo "FAILED: $t"; done
+bash tests/run
 ```
 
 The tests run against fake NanoClaw checkouts and throwaway home directories;

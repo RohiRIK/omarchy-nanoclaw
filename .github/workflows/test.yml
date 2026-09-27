@@ -1,0 +1,32 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stub omarchy and gh
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          cat >"$RUNNER_TEMP/bin/omarchy" <<'EOF'
+          #!/bin/sh
+          echo "omarchy stubbed in CI" >&2
+          exit 0
+          EOF
+          cat >"$RUNNER_TEMP/bin/gh" <<'EOF'
+          #!/bin/sh
+          echo "gh stubbed in CI" >&2
+          exit 0
+          EOF
+          chmod +x "$RUNNER_TEMP/bin/omarchy" "$RUNNER_TEMP/bin/gh"
+          echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
+      - name: Test suite
+        run: tests/run

@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+#
+# Aggregated test runner for the NanoClaw plugin.
+# Runs every shell test, continuing past failures so each one reports.
+
+set -uo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+TEST_DIR="$ROOT/tests"
+
+failed=0
+
+run() {
+  local script="$1"
+  printf '==> %s\n' "$(basename "$script")"
+  if ! bash "$script"; then
+    failed=1
+  fi
+}
+
+for script in "$TEST_DIR"/*.sh; do
+  run "$script"
+done
+
+if [[ $failed -ne 0 ]]; then
+  printf '\nSome tests failed.\n' >&2
+  exit 1
+fi
+
+printf '\nAll tests passed.\n'
