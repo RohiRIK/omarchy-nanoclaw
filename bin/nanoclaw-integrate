@@ -97,10 +97,15 @@ open(path, "w").write(pat.sub("", text, count=1))
 PY
 }
 
+# Create a link only where nothing is, or where the same link already is.
 link() { # target link
   mkdir -p "$(dirname "$2")"
-  if [[ -e $2 && ! -L $2 ]]; then say "Skipped $2: a file you own is already there."; return 1; fi
-  ln -sfn "$1" "$2"
+  if [[ -L $2 ]]; then
+    [[ $(readlink "$2") == "$1" ]] && return 0
+    say "Skipped $2: it links somewhere else (yours)."; return 1
+  fi
+  [[ -e $2 ]] && { say "Skipped $2: a file you own is already there."; return 1; }
+  ln -s "$1" "$2"
 }
 unlink_ours() { [[ -L $1 && $(readlink "$1") == "$PLUGIN_DIR"* ]] && rm -f "$1"; return 0; }
 
@@ -135,11 +140,23 @@ remove_agent() {
   unrecord agent; ok "Keybinding and alias restored"
 }
 
+# The desktop entry is ours only if it carries our marker and still matches
+# the checksum recorded when we wrote it; anything else is the user's file.
+desktop_ours() {
+  [[ -f $DESKTOP ]] && grep -qxF "X-Rohirik-Nanoclaw-Managed=true" "$DESKTOP" \
+    && grep -qxF "app-sha:$(sha256sum "$DESKTOP" | cut -d' ' -f1)" "$STATE" 2>/dev/null
+}
+
 install_app() {
   ask "Add NanoClaw to Apps and the app launcher?" || return 0
   local t="omarchy-launch-floating-terminal-with-presentation"
+  if [[ -e $DESKTOP ]] && ! desktop_ours; then
+    say "Skipped $DESKTOP: it exists and is yours (or you changed it). Remove it to let NanoClaw write one."
+    return 0
+  fi
   link "$PLUGIN_DIR/assets/nanoclaw-app.png" "$ICON" || return 1
   mkdir -p "$(dirname "$DESKTOP")"
+  grep -v '^app-sha:' "$STATE" 2>/dev/null >"$STATE.tmp"; mv -f "$STATE.tmp" "$STATE" 2>/dev/null
   cat >"$DESKTOP" <<EOF
 [Desktop Entry]
 Type=Application
@@ -152,6 +169,7 @@ Terminal=false
 Categories=Utility;
 Keywords=ai;agent;assistant;claw;ncl;
 Actions=dashboard;disposable;clean;
+X-Rohirik-Nanoclaw-Managed=true
 
 [Desktop Action dashboard]
 Name=Dashboard
@@ -165,11 +183,20 @@ Exec=$t $PLUGIN_DIR/bin/nanoclaw-ctl disposable
 Name=Clean up
 Exec=$t $PLUGIN_DIR/bin/nanoclaw-ctl clean
 EOF
+  record "app-sha:$(sha256sum "$DESKTOP" | cut -d' ' -f1)"
   command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q "$DATA/icons/hicolor" 2>/dev/null
   command -v update-desktop-database >/dev/null && update-desktop-database -q "$(dirname "$DESKTOP")" 2>/dev/null
   record app; ok "App entry: NanoClaw in Apps"
 }
-remove_app() { rm -f "$DESKTOP"; unlink_ours "$ICON"; unrecord app; ok "App entry removed"; }
+remove_app() {
+  if desktop_ours; then
+    rm -f "$DESKTOP"
+  elif [[ -e $DESKTOP ]]; then
+    say "Kept $DESKTOP: it was changed after NanoClaw wrote it."
+  fi
+  local r; r="$(grep '^app-sha:' "$STATE" 2>/dev/null)"; [[ -n $r ]] && unrecord "$r"
+  unlink_ours "$ICON"; unrecord app; ok "App entry removed"
+}
 
 install_commands() {
   ask "Put nanoclaw-ctl and NanoClaw's ncl on your PATH (~/.local/bin)?" || return 0

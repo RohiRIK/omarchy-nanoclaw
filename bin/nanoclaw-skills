@@ -282,6 +282,21 @@ link_is_ours() { # agent-name agent-dir skill
 }
 
 # --- actions -----------------------------------------------------------------
+# Link src at target only when nothing is there or it already points at src.
+# A link, file or folder with the same name that is not ours stays untouched,
+# and is not recorded, so dispose/disable can never remove it later.
+place_link() { # src target
+  local src="$1" target="$2"
+  if [[ -L $target ]]; then
+    [[ $(readlink "$target") == "$src" ]] && return 0
+    echo "Skipped $target: it links somewhere else (not ours)." >&2; return 1
+  fi
+  if [[ -e $target ]]; then
+    echo "Skipped $target: something of yours is already there." >&2; return 1
+  fi
+  ln -s "$src" "$target"
+}
+
 case "$ACTION" in
   list)
     discover_all_unique | column -t -s $'\t'
@@ -303,19 +318,17 @@ case "$ACTION" in
     synced=0
     while IFS=$'\t' read -r scope name path; do
       [[ -n $name ]] || continue
+      linked=()
       for agent in $(selected_agents); do
         dir="$(agent_dir "$agent")" || continue
         mkdir -p "$dir"
-        target="$dir/$name"
-        # -sfn matches what Omarchy's own migrations do: replace atomically and
-        # never fail because a previous link is in the way.
-        if ln -sfn "$path" "$target" 2>/dev/null; then
-          synced=$((synced + 1))
+        if place_link "$path" "$dir/$name"; then
+          synced=$((synced + 1)); linked+=("$agent")
         fi
       done
       # Merge, never replace: a narrower --agents on a later sync must not
-      # forget the wider set already provisioned.
-      state_add_agents "$name" $(selected_agents)
+      # forget the wider set already provisioned. Only agents we linked count.
+      ((${#linked[@]})) && state_add_agents "$name" "${linked[@]}"
     done < <(discover_all_unique)
     echo "Provisioned $synced skill link(s)."
     ;;
@@ -365,13 +378,13 @@ case "$ACTION" in
       [[ $name == "$SKILL" ]] && src="$path"
     done < <(discover_all_unique)
     [[ -n $src ]] || { echo "Unknown skill: $SKILL" >&2; exit 1; }
-    count=0
+    count=0; linked=()
     for agent in $(selected_agents); do
       dir="$(agent_dir "$agent")" || continue
       mkdir -p "$dir"
-      ln -sfn "$src" "$dir/$SKILL" && count=$((count + 1))
+      place_link "$src" "$dir/$SKILL" && { count=$((count + 1)); linked+=("$agent"); }
     done
-    state_add_agents "$SKILL" $(selected_agents)
+    ((${#linked[@]})) && state_add_agents "$SKILL" "${linked[@]}"
     echo "Enabled '$SKILL' for $count agent(s)."
     ;;
 

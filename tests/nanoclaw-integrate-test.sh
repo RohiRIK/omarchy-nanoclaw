@@ -75,6 +75,30 @@ cmp -s "$H/.bashrc" "$T/bashrc.orig" && pass "remove: bashrc byte-identical" || 
   && pass "remove: app entry, commands, skill links gone" || fail "remove: leftovers"
 [[ -d $H/.codex/skills/nanoclaw ]] && pass "remove: your own skill folder untouched" || fail "remove: deleted a user folder"
 
+# --- review: never overwrite or delete what is not ours -----------------------
+APPS="$H/.local/share/applications"; D="$APPS/rohirik.nanoclaw.desktop"
+mkdir -p "$APPS" "$H/.local/bin"
+printf '[Desktop Entry]\nName=My own NanoClaw launcher\n' >"$D"
+ln -s /usr/bin/true "$H/.local/bin/nanoclaw-ctl"
+run install app commands --yes
+[[ $(sed -n 2p "$D") == "Name=My own NanoClaw launcher" ]] && pass "app: an existing desktop entry of yours is not overwritten" \
+  || fail "app: overwrote the user's desktop entry"
+[[ $(readlink "$H/.local/bin/nanoclaw-ctl") == /usr/bin/true ]] && pass "commands: your own link with the same name is kept" \
+  || fail "commands: replaced the user's link"
+run remove app commands --yes
+[[ -f $D && -L $H/.local/bin/nanoclaw-ctl ]] && pass "remove: your desktop entry and link survive" || fail "remove: deleted user files"
+
+rm -f "$D" "$H/.local/bin/nanoclaw-ctl"
+run install app --yes
+grep -q "X-Rohirik-Nanoclaw-Managed=true" "$D" && pass "app: our own entry is written and marked" || fail "app: not written"
+echo "NoDisplay=false" >>"$D"          # the user customizes it afterwards
+run install app --yes
+grep -q "^NoDisplay=false" "$D" && pass "app: reinstall keeps your later customization" || fail "app: reinstall clobbered the edit"
+run remove app --yes
+[[ -f $D ]] && grep -q "^NoDisplay=false" "$D" && pass "app: remove keeps a customized entry" || fail "app: remove deleted a customized entry"
+rm -f "$D"; run install app --yes; run remove app --yes
+[[ ! -e $D ]] && pass "app: an untouched entry of ours is removed" || fail "app: our entry was left behind"
+
 echo
 [[ $RC -eq 0 ]] && echo "ALL ASSERTIONS PASSED" || echo "ASSERTION FAILURES"
 exit $RC
