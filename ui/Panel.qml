@@ -44,13 +44,15 @@ Panel {
   readonly property var approvals: snap.approvals || []
   readonly property var channels: snap.channels || []
   readonly property bool running: snap.service === "active"
+  // Installed and set up, just without an agent (e.g. after deleting the last one).
+  readonly property bool noAgentsOnly: !!snap.image && !!snap.service && snap.service !== "not-installed" && agents.length === 0
   readonly property bool serviceInstalled: !!snap.service && snap.service !== "not-installed"
   readonly property bool attention: approvals.length > 0 || (loaded && snap.installed && !snap.setupComplete)
 
   function statusLine() {
     if (!loaded) return "Loading…"
     if (!snap.installed) return "Not installed"
-    if (!snap.setupComplete) return "Setup not finished"
+    if (!snap.setupComplete) return root.noAgentsOnly ? "No agents yet" : "Setup not finished"
     if (snap.service === "not-installed") return "Service not installed"
     return running ? "Running · " + containers.length + " container" + (containers.length === 1 ? "" : "s")
                    : "Service " + snap.service
@@ -212,12 +214,18 @@ Panel {
             spacing: Style.space(6)
             Caption {
               text: !root.snap.installed ? "NanoClaw isn't installed yet."
+                  : root.noAgentsOnly ? "You have no agents. Create one from a template."
                   : "Setup stopped before it finished. Resume it to create your agent."
               color: root.urgent
               wrapMode: Text.WordWrap
               elide: Text.ElideNone
             }
-            Action { text: root.snap.installed ? "Resume setup" : "Install NanoClaw"; onClicked: root.ctl("setup") }
+            Action {
+              text: !root.snap.installed ? "Install NanoClaw" : root.noAgentsOnly ? "Create an agent" : "Resume setup"
+              enabled: !root.noAgentsOnly || root.running
+              onClicked: root.noAgentsOnly ? (root.snap.menu ? root.menu("nanoclaw.templates") : root.ctl("template-create")) : root.ctl("setup")
+            }
+            Caption { visible: root.noAgentsOnly && !root.running; text: "Start the service first (Service › Start)." }
           }
 
           // ---------- Quick actions ----------
