@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Lets NanoClaw be the Omarchy default agent.
+#
+# omarchy-default-agent and omarchy-agent keep a hardcoded agent list in
+# read-only /usr/share/omarchy/bin, which also precedes ~/.local/bin on PATH, so
+# they cannot be extended or shadowed. Instead this writes the same defaults
+# file they read, and the Super+Shift+Ctrl+A binding and the `a` alias call
+# `launch` here, which handles nanoclaw and hands every other agent straight
+# back to omarchy-agent unchanged.
+#
+# Usage:
+#   nanoclaw-default-agent set                 # make NanoClaw the default, then launch it
+#   nanoclaw-default-agent launch [omarchy-agent flags...]
+
+set -uo pipefail
+
+PLUGIN_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+AGENT_FILE="$HOME/.config/omarchy/defaults/agent"
+
+launch_nanoclaw() {
+  local inline=false prompt=()
+  while (($#)); do
+    case "$1" in
+      --inline) inline=true ;;
+      --pick) ;;
+      --prompt) prompt=(--prompt "${2:-}"); shift ;;
+    esac
+    shift
+  done
+  # Same trust-friendly working directory omarchy-agent picks.
+  [[ $PWD == "$HOME" && -d $HOME/Work ]] && cd "$HOME/Work"
+  if $inline; then
+    exec "$PLUGIN_DIR/bin/nanoclaw-agent" "${prompt[@]}"
+  fi
+  # Same app-id as every other agent window, so agent window rules still apply.
+  exec omarchy-launch-tui --app-id=org.omarchy.agent "$PLUGIN_DIR/bin/nanoclaw-agent" "${prompt[@]}"
+}
+
+case "${1:-}" in
+  set)
+    mkdir -p "$(dirname "$AGENT_FILE")"
+    printf 'nanoclaw\n' >"$AGENT_FILE"
+    launch_nanoclaw
+    ;;
+  launch)
+    shift
+    if [[ $(omarchy-default-agent) == nanoclaw ]]; then
+      launch_nanoclaw "$@"
+    fi
+    exec omarchy-agent "$@"
+    ;;
+  *)
+    sed -n '11,13p' "$0" >&2
+    exit 2
+    ;;
+esac

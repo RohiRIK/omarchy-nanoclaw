@@ -1,0 +1,408 @@
+#!/usr/bin/env bash
+# Cross-agent skill provisioning for NanoClaw.
+#
+# Parity model is Omarchy's own: Omarchy ships stock skills in
+# $OMARCHY_PATH/default/agents/skills and its migrations symlink each one into
+# every agent's skills directory (~/.agents/skills, ~/.claude/skills,
+# ~/.codex/skills, ~/.pi/agent/skills, ~/.hermes/skills). This script applies
+# exactly that model to NanoClaw, driven by the plugin's settings.
+#
+# Two scopes:
+#   global   - the stock Omarchy skills (read-only source under /usr/share)
+#   personal - the user's own skills (~/.hermes/skills, ~/.claude/skills)
+#
+# Provisioning is a symlink, never a copy, so a stock skill updated by
+# `omarchy update` reaches every agent at once, and disposing a link never
+# touches the source.
+#
+# Usage:
+#   nanoclaw-skills list
+#   nanoclaw-skills status
+#   nanoclaw-skills sync   [--checkout PATH] [--scope global|personal] [--agents a,b]
+#   nanoclaw-skills dispose [--scope ...] [--agents ...] [--all] [--force]
+#   nanoclaw-skills enable <skill>  [--agents ...]
+#   nanoclaw-skills disable <skill> [--agents ...] [--force]
+#
+# dispose/disable remove only the symlinks this plugin created, i.e. those its
+# state file records. A symlink the user put there themselves is left alone even
+# if its name collides with a discoverable skill, and a real directory is never
+# removed at all. --force waives the state check (still never a real directory),
+# for recovering links whose state file was lost.
+#
+# State is per (skill, agent) and every mutation is a merge or a partial delete,
+# never a whole-record replace. A link that is on disk but unrecorded is an
+# orphan that dispose will refuse to touch, so narrowing --agents must not
+# forget the wider set that is still provisioned.
+
+set -uo pipefail
+
+OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}"
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STATE_DIR="$PLUGIN_DIR/state"
+STATE_FILE="$STATE_DIR/skills.json"
+
+GLOBAL_SOURCE="$OMARCHY_PATH/default/agents/skills"
+PERSONAL_SOURCES=("$HOME/.hermes/skills" "$HOME/.claude/skills")
+
+# The same agent skills dirs Omarchy's own migrations target. NanoClaw is
+# included so the assistant gets the same skill corpus as every other agent.
+AGENT_DIRS=(
+  "claude:$HOME/.claude/skills"
+  "codex:$HOME/.codex/skills"
+  "pi:$HOME/.pi/agent/skills"
+  "agents:$HOME/.agents/skills"
+  "hermes:$HOME/.hermes/skills"
+  "nanoclaw:$HOME/.nanoclaw/skills"
+)
+
+SCOPE="all"
+AGENTS=""
+CHECKOUT=""
+ACTION=""
+SKILL=""
+ALL=false
+FORCE=false
+
+while (($#)); do
+  case "$1" in
+    --scope) SCOPE="${2:-all}"; shift ;;
+    --scope=*) SCOPE="${1#*=}" ;;
+    --agents) AGENTS="${2:-}"; shift ;;
+    --agents=*) AGENTS="${1#*=}" ;;
+    --checkout) CHECKOUT="${2:-}"; shift ;;
+    --checkout=*) CHECKOUT="${1#*=}" ;;
+    --all) ALL=true ;;
+    --force) FORCE=true ;;
+    -*) echo "Unknown option: $1" >&2; exit 2 ;;
+    *)
+      if [[ -z $ACTION ]]; then ACTION="$1"
+      elif [[ -z $SKILL ]]; then SKILL="$1"
+      else echo "Unexpected argument: $1" >&2; exit 2
+      fi
+      ;;
+  esac
+  shift || true
+done
+
+ACTION="${ACTION:-status}"
+mkdir -p "$STATE_DIR"
+
+# --- state -------------------------------------------------------------------
+# A tiny JSON file of "skill -> agents it is provisioned to". Kept in the
+# plugin's own state dir; this is plugin bookkeeping, not agent state, so it is
+# never written into a skill directory.
+load_state() {
+  [[ -f $STATE_FILE ]] && cat "$STATE_FILE" || echo '{"skills":{}}'
+}
+
+# "absent", "ok" or "corrupt". Every reader below used to fall back to an empty
+# state on a parse error, which is safe for reads but meant a truncated
+# skills.json was indistinguishable from "nothing is provisioned" -- so `sync`
+# would happily re-link everything while the file stayed broken, and a user
+# mid-edit could not tell the difference. Mutating actions now stop instead.
+state_status() {
+  [[ -f $STATE_FILE ]] || { echo absent; return; }
+  if python3 -c '
+import json,sys
+v=json.load(open(sys.argv[1]))
+sys.exit(0 if isinstance(v,dict) and isinstance(v.get("skills",{}),dict) else 1)
+' "$STATE_FILE" 2>/dev/null; then echo ok; else echo corrupt; fi
+}
+
+require_state() {
+  case "$(state_status)" in
+    absent|ok) return 0 ;;
+    corrupt)
+      echo "Refusing to act: $STATE_FILE is not a {\"skills\":{...}} object." >&2
+      echo "Inspect it, or delete it to rebuild from scratch." >&2
+      exit 3
+      ;;
+  esac
+}
+
+# Usable as a pipe tail, so the JSON to persist may arrive on stdin -- but a
+# direct call `save_state '{"skills":{}}'` must work too. Reading stdin
+# unconditionally ignored the argument and silently wrote nothing whenever
+# stdin was not a pipe, which is what left dispose --all's state reset a no-op.
+save_state() {
+  local json="${1:-}"
+  [[ -n $json ]] || json="$(cat)"
+  [[ -n $json ]] || return 0
+  local tmp="$STATE_FILE.tmp.$$"
+  printf '%s\n' "$json" >"$tmp" && mv -f "$tmp" "$STATE_FILE"
+}
+
+state_get() { # skill
+  load_state | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: d={"skills":{}}
+print(" ".join(d.get("skills",{}).get(sys.argv[1],[])))' "${1:-}"
+}
+
+# Add agents to a skill's record without dropping the ones already there.
+#
+# sync and enable must MERGE, never replace: provisioning to a narrower set
+# (`sync --agents claude` after `sync --agents claude,codex`) must not erase
+# the codex record. Replacing it orphaned the codex symlink -- still on disk,
+# but no longer in state, so dispose refused to remove it and the only way back
+# was --force. This is the whole reason there is no plain "set" here.
+state_add_agents() { # skill agents...
+  local skill="${1:-}"; shift || true
+  load_state | python3 -c '
+import json,sys
+skill=sys.argv[1]; agents=[a for a in sys.argv[2:] if a]
+try: d=json.load(sys.stdin)
+except Exception: d={"skills":{}}
+d.setdefault("skills",{})
+if agents:
+    d["skills"][skill]=sorted(set(d["skills"].get(skill,[])) | set(agents))
+print(json.dumps(d,indent=2,sort_keys=True))' "$skill" "$@" | save_state
+}
+
+# Drop only the named agents from a skill's record, removing the skill entirely
+# once no agent remains. dispose/disable need this rather than state_set, for
+# the same orphaning reason: disposing one agent must not forget the others.
+state_del_agents() { # skill agents...
+  local skill="${1:-}"; shift || true
+  load_state | python3 -c '
+import json,sys
+skill=sys.argv[1]; agents=[a for a in sys.argv[2:] if a]
+try: d=json.load(sys.stdin)
+except Exception: d={"skills":{}}
+cur=d.get("skills",{}).get(skill,[])
+if agents: cur=[a for a in cur if a not in agents]
+else: cur=[]
+if cur: d.setdefault("skills",{})[skill]=cur
+else: d.get("skills",{}).pop(skill,None)
+print(json.dumps(d,indent=2,sort_keys=True))' "$skill" "$@" | save_state
+}
+
+# --- discovery ---------------------------------------------------------------
+# A skill is any directory containing SKILL.md, matching what both Hermes and
+# Claude Code treat as a skill.
+discover() { # scope -> "scope<TAB>name<TAB>path"
+  local scope="$1" src name path
+  if [[ $scope == "global" || $scope == "all" ]]; then
+    if [[ -d $GLOBAL_SOURCE ]]; then
+      for path in "$GLOBAL_SOURCE"/*/; do
+        [[ -f $path/SKILL.md ]] || continue
+        name=${path%/}; name=${name##*/}
+        printf 'global\t%s\t%s\n' "$name" "${path%/}"
+      done
+    fi
+  fi
+  if [[ $scope == "personal" || $scope == "all" ]]; then
+    for src in "${PERSONAL_SOURCES[@]}"; do
+      [[ -d $src ]] || continue
+      # Two levels deep: personal skills are grouped in category folders.
+      for path in "$src"/*/ "$src"/*/*/; do
+        [[ -f $path/SKILL.md ]] || continue
+        name=${path%/}; name=${name##*/}
+        printf 'personal\t%s\t%s\n' "$name" "${path%/}"
+      done
+    done
+  fi
+}
+
+# Personal skills that are themselves symlinks into the stock Omarchy source
+# are the global ones already; provisioning them again would duplicate the
+# link chain. Skip anything whose realpath is already the global source.
+discover_personal_unique() {
+  local real_global="$GLOBAL_SOURCE"
+  discover personal | while IFS=$'\t' read -r scope name path; do
+    local real
+    real=$(readlink -f "$path" 2>/dev/null || echo "$path")
+    case "$real" in
+      "$real_global"/*) continue ;;
+    esac
+    printf '%s\t%s\t%s\n' "$scope" "$name" "$path"
+  done
+}
+
+discover_all_unique() {
+  local out
+  out="$(discover global)"
+  if [[ $SCOPE == "all" || $SCOPE == "personal" ]]; then
+    out+=$'\n'"$(discover_personal_unique)"
+  fi
+  printf '%s\n' "$out" | sed '/^$/d' | sort -u -k2,2
+}
+
+agent_dir() { # agent-name
+  local pair
+  for pair in "${AGENT_DIRS[@]}"; do
+    [[ ${pair%%:*} == "$1" ]] && { printf '%s' "${pair#*:}"; return 0; }
+  done
+  return 1
+}
+
+selected_agents() {
+  if [[ -n $AGENTS ]]; then
+    printf '%s' "$AGENTS" | tr ',' ' '
+  else
+    local pair
+    for pair in "${AGENT_DIRS[@]}"; do printf '%s ' "${pair%%:*}"; done
+  fi
+}
+
+# Every skill this plugin believes it has provisioned, one name per line. This
+# is the record of what WE created -- as opposed to what happens to be
+# discoverable on disk right now.
+state_skills() {
+  load_state | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: d={"skills":{}}
+for k in sorted(d.get("skills",{})): print(k)'
+}
+
+# Is $dir/$skill a symlink this plugin created for $agent?
+#
+# Two rules, both required:
+#   1. it is a symlink -- a real directory there belongs to the user, and rule 2
+#      alone would not save it if the user happened to reuse a skill name.
+#   2. the state file records this skill as provisioned to this agent.
+#
+# Rule 2 is what makes dispose safe. Matching on the name alone (the old
+# behaviour) deletes any symlink a user ever put there, including one pointing
+# somewhere completely unrelated, as long as the name collides with a
+# discoverable skill. --force waives rule 2, and only rule 2, so a lost state
+# file is recoverable; a real directory is still never removed.
+#
+# Driving off state rather than discovery also fixes an orphan: a link whose
+# source has since been deleted is no longer discoverable, so a discovery-driven
+# dispose could never find it again. It stays in state, so it stays disposable.
+link_is_ours() { # agent-name agent-dir skill
+  local agent="$1" dir="$2" skill="$3" agents
+  [[ -L $dir/$skill ]] || return 1
+  $FORCE && return 0
+  agents=" $(state_get "$skill") "
+  [[ $agents == *" $agent "* ]]
+}
+
+# --- actions -----------------------------------------------------------------
+case "$ACTION" in
+  list)
+    discover_all_unique | column -t -s $'\t'
+    ;;
+
+  status)
+    printf 'Skill provisioning status\n\n'
+    printf '%-24s %-10s %s\n' SKILL SCOPE AGENTS
+    while IFS=$'\t' read -r scope name path; do
+      [[ -n $name ]] || continue
+      agents="$(state_get "$name")"
+      [[ -n $agents ]] || agents="(none)"
+      printf '%-24s %-10s %s\n' "$name" "$scope" "$agents"
+    done < <(discover_all_unique)
+    ;;
+
+  sync)
+    require_state
+    synced=0
+    while IFS=$'\t' read -r scope name path; do
+      [[ -n $name ]] || continue
+      for agent in $(selected_agents); do
+        dir="$(agent_dir "$agent")" || continue
+        mkdir -p "$dir"
+        target="$dir/$name"
+        # -sfn matches what Omarchy's own migrations do: replace atomically and
+        # never fail because a previous link is in the way.
+        if ln -sfn "$path" "$target" 2>/dev/null; then
+          synced=$((synced + 1))
+        fi
+      done
+      # Merge, never replace: a narrower --agents on a later sync must not
+      # forget the wider set already provisioned.
+      state_add_agents "$name" $(selected_agents)
+    done < <(discover_all_unique)
+    echo "Provisioned $synced skill link(s)."
+    ;;
+
+  dispose)
+    require_state
+    removed=0
+    if $ALL; then
+      # Dispose the links only, and only the ones state says we created.
+      # Sources under /usr/share and the user's own skill directories are never
+      # touched: we only ever unlink a symlink inside an agent skills dir.
+      for agent in $(selected_agents); do
+        dir="$(agent_dir "$agent")" || continue
+        [[ -d $dir ]] || continue
+        while IFS= read -r name; do
+          [[ -n $name ]] || continue
+          if link_is_ours "$agent" "$dir" "$name"; then
+            rm -f "$dir/$name" && removed=$((removed + 1))
+          fi
+        done < <(state_skills)
+      done
+      # Forget only the agents just disposed. Blanking the whole file would
+      # orphan links belonging to agents outside this --agents set: still on
+      # disk, but unrecorded, so a later dispose would refuse to remove them.
+      for name in $(state_skills); do
+        state_del_agents "$name" $(selected_agents)
+      done
+      echo "Disposed $removed skill link(s)."
+    else
+      [[ -n $SKILL ]] || { echo "dispose needs a skill name, or --all" >&2; exit 2; }
+      for agent in $(selected_agents); do
+        dir="$(agent_dir "$agent")" || continue
+        if link_is_ours "$agent" "$dir" "$SKILL"; then
+          rm -f "$dir/$SKILL" && removed=$((removed + 1))
+        fi
+      done
+      state_del_agents "$SKILL" $(selected_agents)
+      echo "Disposed $removed link(s) for '$SKILL'."
+    fi
+    ;;
+
+  enable)
+    [[ -n $SKILL ]] || { echo "enable needs a skill name" >&2; exit 2; }
+    require_state
+    src=""
+    while IFS=$'\t' read -r scope name path; do
+      [[ $name == "$SKILL" ]] && src="$path"
+    done < <(discover_all_unique)
+    [[ -n $src ]] || { echo "Unknown skill: $SKILL" >&2; exit 1; }
+    count=0
+    for agent in $(selected_agents); do
+      dir="$(agent_dir "$agent")" || continue
+      mkdir -p "$dir"
+      ln -sfn "$src" "$dir/$SKILL" && count=$((count + 1))
+    done
+    state_add_agents "$SKILL" $(selected_agents)
+    echo "Enabled '$SKILL' for $count agent(s)."
+    ;;
+
+  disable)
+    [[ -n $SKILL ]] || { echo "disable needs a skill name" >&2; exit 2; }
+    require_state
+    count=0
+    for agent in $(selected_agents); do
+      dir="$(agent_dir "$agent")" || continue
+      # Same ownership rule as dispose: a symlink we did not create is the
+      # user's, whatever it is called.
+      link_is_ours "$agent" "$dir" "$SKILL" && { rm -f "$dir/$SKILL"; count=$((count + 1)); }
+    done
+    state_del_agents "$SKILL" $(selected_agents)
+    echo "Disabled '$SKILL' from $count agent(s)."
+    ;;
+
+  state)
+    # Machine-readable self-check for nanoclaw-status.
+    case "$(state_status)" in
+      absent) echo "absent (no skill provisioned yet)" ;;
+      ok)     echo "ok" ;;
+      corrupt)
+        echo "corrupt: $STATE_FILE is not a {\"skills\":{...}} object" >&2
+        exit 3
+        ;;
+    esac
+    ;;
+
+  *)
+    echo "Usage: nanoclaw-skills {list|status|state|sync|dispose|enable|disable}" >&2
+    exit 2
+    ;;
+esac

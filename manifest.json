@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "id": "rohirik.nanoclaw",
+  "name": "NanoClaw",
+  "version": "0.2.0",
+  "author": "Rohi Rikman",
+  "license": "MIT",
+  "repository": "https://github.com/RohiRIK/omarchy-nanoclaw",
+  "homepage": "https://github.com/RohiRIK/omarchy-nanoclaw",
+  "description": "Unofficial Omarchy integration for NanoClaw, the self-hosted container-isolated AI assistant: bar dashboard, chat, disposable agents, templates, channels and cleanup.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "ui/Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "NanoClaw",
+    "description": "NanoClaw dashboard: service, agents, running containers, approvals and channels, with chat and disposable agents.",
+    "category": "AI",
+    "aliases": [
+      "nanoclaw",
+      "ncl"
+    ],
+    "allowMultiple": false,
+    "defaults": {
+      "refreshIntervalSec": 60,
+      "checkoutPath": ""
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 15,
+        "max": 900,
+        "step": 15,
+        "defaultValue": 60
+      },
+      {
+        "key": "checkoutPath",
+        "type": "path",
+        "label": "NanoClaw checkout",
+        "defaultValue": "",
+        "description": "Leave empty to auto-detect ~/nanoclaw."
+      }
+    ]
+  }
+}

@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Terminal session with your NanoClaw agent.
+#
+# This is what launches when NanoClaw is the Omarchy default agent. NanoClaw is
+# a service you message, not a TUI, so this is a thin prompt loop over upstream's
+# own `pnpm run chat`, which talks to the host over the CLI channel socket
+# (data/cli.sock). It never starts the service or touches containers.
+#
+# Preconditions (upstream's): the NanoClaw host service is running and an agent
+# group is wired to `cli/local` (via /init-first-agent or /manage-channels).
+#
+# Usage: nanoclaw-agent [--prompt TEXT]
+#
+# Inside the loop:  /status  health check    /claude  manage with Claude Code
+#                   /exit    quit (or Ctrl+D)
+
+set -uo pipefail
+
+PLUGIN_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+
+prompt=""
+while (($#)); do
+  case "$1" in
+    --prompt)
+      if [[ $# -lt 2 ]]; then echo "--prompt requires a value" >&2; exit 2; fi
+      prompt="$2"; shift ;;
+    --prompt=*) prompt="${1#*=}" ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    *) echo "Unknown argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+checkout=""
+for candidate in "${NANOCLAW_PATH:-}" "$HOME/nanoclaw" "$HOME/nanoclaw-v2"; do
+  [[ -n $candidate && -f $candidate/nanoclaw.sh ]] && { checkout="$candidate"; break; }
+done
+
+# Not installed: hand over to the one install path (pinned clone + upstream's
+# guided setup), right here in this terminal.
+if [[ -z $checkout ]]; then
+  exec "$PLUGIN_DIR/bin/nanoclaw-ctl" setup
+fi
+
+cd "$checkout" || exit 1
+
+# A checkout whose setup never finished has no agent to answer; resuming the
+# setup is the only useful thing to offer.
+if [[ ! -f $checkout/data/v2.db ]] || ! python3 - "$checkout/data/v2.db" <<'EOF'
+import sqlite3, sys
+db = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+sys.exit(0 if db.execute("SELECT 1 FROM agent_groups LIMIT 1").fetchone() else 1)
+EOF
+then
+  echo "NanoClaw's setup has not finished yet (no agent exists)."
+  read -rp "Resume the guided setup now? [Y/n] " answer
+  [[ ${answer,,} == n* ]] && exit 1
+  exec "$PLUGIN_DIR/bin/nanoclaw-ctl" setup
+fi
+
+if ! command -v pnpm >/dev/null 2>&1; then
+  echo "pnpm is not on PATH; NanoClaw's setup normally installs it. Re-run: bash nanoclaw.sh" >&2
+  exit 1
+fi
+
+# tsx trips a DEP0205 deprecation warning on Node 26; it is noise, not an error.
+send() { NODE_OPTIONS="--no-deprecation ${NODE_OPTIONS:-}" pnpm run --silent chat "$@"; }
+
+# Nothing answering the terminal (setup wires its template agent to your chosen
+# channel only): connect the first agent, unless a disposable session owns it.
+if [[ -z ${NANOCLAW_AGENT_LABEL:-} && -S $checkout/data/ncl.sock ]] && ! python3 - "$checkout/data/v2.db" <<'PY'
+import sqlite3, sys
+db = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+row = db.execute("""SELECT 1 FROM messaging_group_agents mga JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+                    WHERE mg.channel_type = 'cli' AND mg.platform_id = 'local'
+                      AND COALESCE(mga.engage_pattern, '.') <> '(?!)' LIMIT 1""").fetchone()
+sys.exit(0 if row else 1)
+PY
+then
+  "$PLUGIN_DIR/bin/nanoclaw-ctl" main
+fi
+
+if [[ ! -S $checkout/data/cli.sock ]]; then
+  printf '\033[33mThe NanoClaw service is not reachable (no data/cli.sock).\033[0m\n'
+  printf 'Start it with: nanoclaw-ctl service start   or type /status\n\n'
+fi
+
+[[ -n $prompt ]] && send "$prompt"
+
+HISTFILE="$PLUGIN_DIR/state/chat_history"
+history -r "$HISTFILE" 2>/dev/null
+label="${NANOCLAW_AGENT_LABEL:-nanoclaw}"
+printf '\033[2mNanoClaw (%s) · %s · /status /claude /exit\033[0m\n' "$label" "$checkout"
+
+while IFS= read -e -r -p $'\001\033[1;36m\002'"$label"$' ›\001\033[0m\002 ' line; do
+  [[ -z ${line//[[:space:]]/} ]] && continue
+  history -s "$line"
+  history -w "$HISTFILE" 2>/dev/null
+  case "$line" in
+    /exit|/quit) break ;;
+    /status) "$PLUGIN_DIR/bin/nanoclaw-status" ;;
+    /claude) exec claude ;;
+    *) send "$line" ;;
+  esac
+done
+echo

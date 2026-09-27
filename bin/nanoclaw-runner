@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# NanoClaw container runner.
+#
+# This is a *test* and *bench* runner for agent container images, not a
+# replacement for NanoClaw's own orchestrator. It never touches a running
+# NanoClaw container: every container it starts is named ncl-bench-* and is
+# created with --rm, so it cannot outlive the command.
+#
+# Usage:
+#   nanoclaw-runner preflight
+#   nanoclaw-runner shell   [--image IMG] [--ephemeral|--persistent AGENT]
+#   nanoclaw-runner bench   [--image IMG] [--suite default]
+#   nanoclaw-runner teardown
+
+set -uo pipefail
+
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONTAINER_PREFIX="ncl-bench"
+IMAGE="${NANOCLAW_TEST_IMAGE:-alpine:latest}"
+MEMORY="${NANOCLAW_TEST_MEMORY:-4g}"
+CPUS="${NANOCLAW_TEST_CPUS:-2}"
+MODE="ephemeral"
+AGENT_ID=""
+TIMEOUT="${NANOCLAW_TEST_TIMEOUT:-120}"
+
+while (($#)); do
+  case "$1" in
+    --image) IMAGE="${2:-}"; shift ;;
+    --image=*) IMAGE="${1#*=}" ;;
+    --ephemeral) MODE="ephemeral" ;;
+    --persistent) MODE="persistent" ;;
+    --suite) SUITE="${2:-default}"; shift ;;
+    --suite=*) SUITE="${1#*=}" ;;
+    --agent) AGENT_ID="${2:-}"; shift ;;
+    --agent=*) AGENT_ID="${1#*=}" ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    *) ACTION="$1" ;;
+  esac
+  shift || true
+done
+ACTION="${ACTION:-preflight}"
+SUITE="${SUITE:-default}"
+
+log()  { printf '\033[2m%s\033[0m\n' "$*"; }
+pass() { printf '\033[32mPASS\033[0m  %s\n' "$*"; }
+fail() { printf '\033[31mFAIL\033[0m  %s\n' "$*"; FAILURES=$((FAILURES + 1)); }
+FAILURES=0
+
+runtime() {
+  if command -v docker >/dev/null 2>&1; then echo docker
+  elif command -v podman >/dev/null 2>&1; then echo podman
+  else echo ""; fi
+}
+
+cleanup() {
+  # Remove only containers this script created.
+  local r; r=$(runtime)
+  [[ -n $r ]] || return 0
+  $r ps -aq --filter "name=^${CONTAINER_PREFIX}" 2>/dev/null | xargs -r $r rm -f >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
+# Agents must never run as root on the host filesystem: a container that writes
+# as uid 0 leaves root-owned files the user cannot edit. Map the host user in.
+user_flags() {
+  if [[ $(id -u) -ne 0 ]]; then
+    echo "--user $(id -u):$(id -g)"
+  else
+    echo ""
+  fi
+}
+
+mount_path() {
+  # Persistent state lives under the plugin's own data dir, mapped to the same
+  # path inside the container so relative paths in agent config keep working.
+  local base="${XDG_DATA_HOME:-$HOME/.local/share}/omarchy/nanoclaw/agents"
+  [[ -n $AGENT_ID ]] || AGENT_ID="default"
+  mkdir -p "$base/$AGENT_ID"
+  printf '%s' "$base/$AGENT_ID"
+}
+
+case "$ACTION" in
+  preflight)
+    log "== preflight =="
+    r=$(runtime)
+    if [[ -z $r ]]; then
+      fail "no container runtime (docker or podman) on PATH"; echo; exit 1
+    fi
+    pass "runtime: $r"
+    if $r info >/dev/null 2>&1; then pass "daemon reachable"
+    else fail "daemon not reachable"; echo; exit 1; fi
+    if $r image inspect "$IMAGE" >/dev/null 2>&1; then pass "image present: $IMAGE"
+    else log "pulling $IMAGE"; $r pull "$IMAGE" >/dev/null 2>&1 && pass "image pulled: $IMAGE" || fail "image unavailable: $IMAGE"; fi
+    log "host uid: $(id -u):$(id -g)  memory: $MEMORY  cpus: $CPUS"
+    ;;
+
+  shell)
+    r=$(runtime); [[ -n $r ]] || { fail "no container runtime"; exit 1; }
+    state="$(mount_path)"
+    log "Starting $MODE container as uid $(id -u). State: $state"
+    # --rm so the container cannot outlive this command; --user so host files
+    # stay owned by the user; resource caps so a runaway agent is contained.
+    exec $r run --rm -it \
+      --name "${CONTAINER_PREFIX}-shell-$$" \
+      $(user_flags) \
+      --memory "$MEMORY" --cpus "$CPUS" \
+      --tmpfs /tmp:rw,noexec,nosuid,size=256m \
+      -v "$state:$state" \
+      -w "$state" \
+      "$IMAGE" sh
+    ;;
+
+  bench)
+    r=$(runtime); [[ -n $r ]] || { fail "no container runtime"; exit 1; }
+    log "== bench: $SUITE =="
+    name="${CONTAINER_PREFIX}-bench-$$"
+    start=$(date +%s%N)
+
+    # Isolation: plant a canary in the host home and assert the container
+    # cannot see it. A bare "test ! -e <home>" is vacuous -- the path simply
+    # does not exist inside the image -- so it passes whether or not the host
+    # filesystem is actually mounted. The canary can only be visible if the
+    # host home really leaked in.
+    canary_dir="$HOME/.local/state/omarchy"
+    canary="$canary_dir/ncl-bench-canary-$$"
+    mkdir -p "$canary_dir" && : >"$canary"
+    if out=$($r run --rm --name "$name" $(user_flags) --memory "$MEMORY" --cpus "$CPUS" \
+          --network none "$IMAGE" sh -c "test ! -e '$canary'" 2>&1) \
+       && $r run --rm --name "$name" $(user_flags) --network none "$IMAGE" \
+          sh -c "test ! -e '$HOME'" >/dev/null 2>&1; then
+      pass "isolation: host home and canary not visible"
+    else
+      fail "isolation: host filesystem reachable: $out"
+    fi
+    rm -f "$canary"
+
+    # Resource caps applied as configured.
+    if $r run --rm --name "$name" $(user_flags) --memory "$MEMORY" --cpus "$CPUS" \
+         "$IMAGE" sh -c 'test -n "$(id -u)"' >/dev/null 2>&1; then
+      pass "runs with memory=$MEMORY cpus=$CPUS"
+    else
+      fail "resource flags rejected by runtime"
+    fi
+
+    # --rm lifecycle: the container must be gone once the command returns.
+    $r run --rm --name "$name" $(user_flags) "$IMAGE" true >/dev/null 2>&1
+    if $r ps -aq --filter "name=^$name" | grep -q .; then
+      fail "--rm did not remove the container"
+    else
+      pass "--rm lifecycle removes the container"
+    fi
+
+    end=$(date +%s%N)
+    log "wall: $(( (end - start) / 1000000 ))ms"
+    ;;
+
+  teardown)
+    cleanup
+    echo "Tore down ${CONTAINER_PREFIX}* containers."
+    ;;
+
+  *)
+    echo "Usage: nanoclaw-runner {preflight|shell|bench|teardown}" >&2
+    exit 2
+    ;;
+esac
+
+echo
+if [[ $FAILURES -gt 0 ]]; then
+  printf '\033[31m%s check(s) failed\033[0m\n' "$FAILURES"
+  exit 1
+fi
+echo "All checks passed."

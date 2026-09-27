@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""NanoClaw dashboard snapshot for the bar panel, as one JSON object.
+
+Reads NanoClaw's central SQLite database read-only and asks Docker for the
+running agent containers. It never calls `ncl`: every ncl call boots Node
+(seconds), and the socket only exists while the host runs, while the panel
+must also explain a stopped or half-installed NanoClaw.
+
+Usage: nanoclaw-dash [--checkout PATH]
+"""
+import hashlib
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+
+def find_checkout(explicit):
+    candidates = [explicit, os.environ.get("NANOCLAW_PATH"),
+                  str(Path.home() / "nanoclaw"), str(Path.home() / "nanoclaw-v2")]
+    for c in candidates:
+        if c and (Path(c) / "nanoclaw.sh").is_file():
+            return str(Path(c).resolve())
+    return ""
+
+
+def install_slug(checkout):
+    # Mirrors upstream src/install-slug.ts: sha1 of the project root, 8 hex chars.
+    override = os.environ.get("NANOCLAW_INSTALL_ID")
+    return override or hashlib.sha1(checkout.encode()).hexdigest()[:8]
+
+
+def run(cmd, timeout=4):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return 1, ""
+
+
+def service_state(unit):
+    code, out = run(["systemctl", "--user", "list-unit-files", unit + ".service", "--no-legend"])
+    if not out:
+        return "not-installed"
+    _, state = run(["systemctl", "--user", "is-active", unit + ".service"])
+    return state or "inactive"
+
+
+def containers(slug):
+    code, out = run(["docker", "ps", "--filter", f"label=nanoclaw-install={slug}",
+                     "--format", '{{.Names}}\t{{.Status}}\t{{.RunningFor}}\t{{.Label "nanoclaw-group-folder"}}\t{{.Label "nanoclaw-role"}}'])
+    rows = []
+    for line in out.splitlines():
+        name, status, age, folder, role = (line.split("\t") + [""] * 5)[:5]
+        rows.append({"name": name, "status": status, "age": age, "folder": folder, "role": role or "agent"})
+    return rows, code == 0
+
+
+def image_present(slug):
+    _, out = run(["docker", "images", "-q", f"nanoclaw-agent-v2-{slug}"])
+    return bool(out)
+
+
+def query(db, sql, args=()):
+    try:
+        return [dict(r) for r in db.execute(sql, args)]
+    except sqlite3.Error:
+        return []
+
+
+def main():
+    explicit = ""
+    argv = sys.argv[1:]
+    while argv:
+        a = argv.pop(0)
+        if a == "--checkout" and argv:
+            explicit = argv.pop(0)
+        elif a.startswith("--checkout="):
+            explicit = a.split("=", 1)[1]
+        elif a in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
+
+    checkout = find_checkout(explicit)
+    snap = {"installed": bool(checkout), "checkout": checkout, "service": "not-installed",
+            "unit": "", "setupComplete": False, "image": False, "docker": False,
+            "agents": [], "containers": [], "approvals": [], "channels": [],
+            "menu": False, "counts": {"agents": 0, "running": 0, "sessions": 0, "approvals": 0, "channels": 0}}
+    if not checkout:
+        print(json.dumps(snap))
+        return 0
+
+    slug = install_slug(checkout)
+    snap["unit"] = f"nanoclaw-v2-{slug}"
+    snap["service"] = service_state(snap["unit"])
+    snap["image"] = image_present(slug)
+    snap["containers"], snap["docker"] = containers(slug)
+
+    db_path = Path(checkout) / "data" / "v2.db"
+    if db_path.is_file():
+        db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1)
+        db.row_factory = sqlite3.Row
+        groups = query(db, "SELECT id, name, folder, agent_provider, created_at FROM agent_groups ORDER BY created_at")
+        sessions = query(db, "SELECT agent_group_id, status, container_status FROM sessions")
+        wirings = query(db, """SELECT mga.agent_group_id, mg.channel_type, mg.platform_id, mg.name
+                                 FROM messaging_group_agents mga
+                                 JOIN messaging_groups mg ON mg.id = mga.messaging_group_id""")
+        for g in groups:
+            mine = [s for s in sessions if s["agent_group_id"] == g["id"]]
+            running = [c for c in snap["containers"] if c["folder"] == g["folder"]]
+            snap["agents"].append({
+                "id": g["id"], "name": g["name"], "folder": g["folder"],
+                "provider": g.get("agent_provider") or "claude",
+                "sessions": len(mine),
+                "activeSessions": sum(1 for s in mine if s.get("status") == "active"),
+                "running": len(running),
+                "disposable": g["folder"].startswith("tmp-"),
+                "channels": sorted({f"{w['channel_type']}/{w['name'] or w['platform_id']}"
+                                    for w in wirings if w["agent_group_id"] == g["id"]}),
+            })
+        names = {g["id"]: g["name"] for g in groups}
+        snap["approvals"] = [
+            {"id": a["approval_id"], "title": a.get("title") or a["action"],
+             "agent": names.get(a.get("agent_group_id"), "")}
+            for a in query(db, "SELECT * FROM pending_approvals WHERE status = 'pending' ORDER BY created_at")
+        ]
+        snap["channels"] = sorted({f"{w['channel_type']}/{w['name'] or w['platform_id']}" for w in wirings})
+        snap["counts"]["sessions"] = len(sessions)
+        db.close()
+
+    # The panel opens menu routes only when nanoclaw-integrate added them.
+    menu = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "omarchy/extensions/omarchy-menu.jsonc"
+    snap["menu"] = menu.is_file() and ">>> rohirik.nanoclaw" in menu.read_text(errors="ignore")
+
+    # Setup is done once there is an agent to talk to and something to run it.
+    snap["setupComplete"] = bool(snap["agents"]) and snap["image"] and snap["service"] != "not-installed"
+    snap["counts"].update(agents=len(snap["agents"]), running=len(snap["containers"]),
+                          approvals=len(snap["approvals"]), channels=len(snap["channels"]))
+    print(json.dumps(snap))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,6 @@
+# Per-install bookkeeping: chat history, provisioning and integration records.
+state/*
+!state/.gitkeep
+__pycache__/
+*.pyc
+*.new

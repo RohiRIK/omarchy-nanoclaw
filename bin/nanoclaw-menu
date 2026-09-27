@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# NanoClaw launcher entry point for Omarchy.
+#
+# Opens the preflight/control surface in a themed floating terminal. NanoClaw
+# itself is never started by this script: it is a service, and starting it is
+# `nanoclaw.sh` / your service manager's job.
+#
+# Usage: nanoclaw-menu [--preflight|--install|--ephemeral|--persistent|--uninstall-dry-run]
+
+set -uo pipefail
+
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STATUS="$PLUGIN_DIR/bin/nanoclaw-status"
+
+mode="${1:---preflight}"
+
+case "$mode" in
+  --preflight)      exec "$STATUS" --preflight ;;
+  --install)       exec "$PLUGIN_DIR/bin/nanoclaw-ctl" setup ;;
+  --ephemeral)     exec "$PLUGIN_DIR/bin/nanoclaw-ctl" disposable ;;
+  --persistent)    exec "$PLUGIN_DIR/bin/nanoclaw-ctl" agents ;;
+  --uninstall-dry-run) exec bash -c 'cd "${NANOCLAW_PATH:-$HOME/nanoclaw}" 2>/dev/null || { echo "No NanoClaw checkout."; exit 0; }; bash nanoclaw.sh --uninstall --dry-run; read -rp "Press Enter to close" _' ;;
+  *)
+    echo "Usage: nanoclaw-menu [--preflight|--install|--ephemeral|--persistent|--uninstall-dry-run]" >&2
+    exit 2
+    ;;
+esac

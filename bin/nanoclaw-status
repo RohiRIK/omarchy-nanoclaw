@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# NanoClaw status + preflight for Omarchy.
+#
+# Reports real state only. NanoClaw owns its own container lifecycle; this
+# script never creates, stops, or reconfigures containers, because doing so
+# would fight its orchestrator for the same resources.
+#
+# Usage: nanoclaw-status [--json] [--preflight] [--checkout PATH]
+
+set -uo pipefail
+
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+JSON=false
+PREFLIGHT=false
+CHECKOUT=""
+
+# Consume the argument list in place. A `for arg in "$@"` loop would iterate a
+# snapshot, so the shift inside it would desynchronise $1/$2 from the item being
+# processed: the documented `--checkout PATH` form would read PATH as a stray
+# unknown argument and exit 2.
+while (($#)); do
+  case "$1" in
+    --json) JSON=true ;;
+    --preflight) PREFLIGHT=true ;;
+    --checkout)
+      if [[ $# -lt 2 ]]; then echo "--checkout requires a PATH" >&2; exit 2; fi
+      CHECKOUT="$2"; shift ;;
+    --checkout=*)
+      # An empty value must not silently degrade to auto-detection: the caller
+      # would get a health report about a different directory than intended.
+      if [[ -z ${1#*=} ]]; then echo "--checkout requires a non-empty PATH" >&2; exit 2; fi
+      CHECKOUT="${1#*=}" ;;
+    *) echo "Unknown argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+ok=0; warn=0; fail=0
+declare -a NOTES=()
+
+note() { # level|message
+  local level="$1" msg="$2"
+  case "$level" in
+    ok) ok=$((ok + 1)) ;;
+    warn) warn=$((warn + 1)) ;;
+    fail) fail=$((fail + 1)) ;;
+  esac
+  NOTES+=("$level|$msg")
+  $JSON || printf '[%s] %s\n' "${level^^}" "$msg"
+}
+
+# Locate the checkout. NanoClaw is a git checkout, not a package, so there is
+# no `which nanoclaw`; we look for its marker files.
+detect_checkout() {
+  if [[ -n $CHECKOUT ]]; then
+    [[ -d $CHECKOUT ]] && { printf '%s' "$CHECKOUT"; return 0; }
+    return 1
+  fi
+  local candidate
+  for candidate in "$HOME/nanoclaw" "$HOME/nanoclaw-v2" "$HOME/.nanoclaw" \
+                   "$HOME/Work/nanoclaw" "$HOME/src/nanoclaw"; do
+    if [[ -d $candidate ]]; then
+      if [[ -f $candidate/nanoclaw.sh || -f $candidate/package.json || -d $candidate/.git ]]; then
+        printf '%s' "$candidate"; return 0
+      fi
+    fi
+  done
+  # Last resort: anything under ~/ matching nanoclaw* with the marker.
+  for candidate in "$HOME"/nanoclaw*; do
+    [[ -d $candidate ]] && { printf '%s' "$candidate"; return 0; }
+  done
+  return 1
+}
+
+CHECKOUT_DIR="$(detect_checkout)" || CHECKOUT_DIR=""
+
+# --- Container runtime -------------------------------------------------------
+RUNTIME=""
+if command -v docker >/dev/null 2>&1; then RUNTIME=docker; fi
+if [[ -z $RUNTIME ]] && command -v podman >/dev/null 2>&1; then RUNTIME=podman; fi
+
+if [[ -z $RUNTIME ]]; then
+  note fail "No container runtime found (neither docker nor podman on PATH). NanoClaw requires one."
+elif ! $RUNTIME info >/dev/null 2>&1; then
+  note fail "$RUNTIME is installed but the daemon is not reachable."
+else
+  note ok "$RUNTIME daemon reachable."
+fi
+
+# --- Checkout ----------------------------------------------------------------
+if [[ -z $CHECKOUT_DIR ]]; then
+  note warn "No NanoClaw checkout found. Looked in ~/nanoclaw, ~/nanoclaw-v2, ~/.nanoclaw."
+  note warn "Install it with: nanoclaw-ctl setup (or the panel's Install NanoClaw button)."
+else
+  note ok "Checkout: $CHECKOUT_DIR"
+  if [[ -f $CHECKOUT_DIR/nanoclaw.sh ]]; then
+    note ok "Setup script present (nanoclaw.sh)."
+  else
+    note warn "nanoclaw.sh not found in the checkout; install may be incomplete."
+  fi
+fi
+
+# --- Service -----------------------------------------------------------------
+SERVICE_STATE="absent"
+# Upstream installs a *user* unit on Linux, so check that scope first. v2 names
+# it per install: nanoclaw-v2-<first 8 hex of sha1(checkout path)>.
+units=(nanoclaw.service nanoclaw-gateway.service)
+if [[ -n $CHECKOUT_DIR ]]; then
+  units=("nanoclaw-v2-$(printf '%s' "$(realpath "$CHECKOUT_DIR")" | sha1sum | cut -c1-8).service" "${units[@]}")
+fi
+for scope in --user --system; do
+  for unit in "${units[@]}"; do
+    if systemctl "$scope" list-unit-files "$unit" 2>/dev/null | grep -q "$unit"; then
+      # is-active prints "inactive" itself and exits non-zero; `|| echo` would
+      # have doubled it up.
+      SERVICE_STATE="$(systemctl "$scope" is-active "$unit" 2>/dev/null)"
+      SERVICE_STATE="${SERVICE_STATE:-inactive}"
+      note ok "systemd ${scope#--} unit $unit: $SERVICE_STATE"
+      break 2
+    fi
+  done
+done
+# A bare `pgrep -f nanoclaw` matches THIS script: the plugin lives at
+# .../<plugin>/bin/nanoclaw-status, so its own argv always contains the
+# string, and the check silently reported "running" on every host. Filter out
+# any hit whose command line points at this plugin (or at our own shell
+# wrappers), which leaves only a genuine NanoClaw process.
+#
+# Our own ancestors are excluded too: whatever launched this check (a test
+# runner, `bash -c 'cd <plugin> && ...'`, a terminal wrapper) carries
+# "nanoclaw" in its argv without being NanoClaw, and used to mask the warning.
+ancestor_pids() {
+  local pid=$$ ppid
+  while [[ $pid -gt 1 ]]; do
+    printf '%s\n' "$pid"
+    read -r _ _ _ ppid _ <"/proc/$pid/stat" 2>/dev/null || break
+    pid=$ppid
+  done
+}
+
+nanoclaw_running() {
+  local pid cmdline cwd
+  local -A skip=()
+  while read -r pid; do skip[$pid]=1; done < <(ancestor_pids)
+  while read -r pid; do
+    [[ -n $pid && -z ${skip[$pid]:-} ]] || continue
+    cmdline="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)" || continue
+    [[ -n $cmdline ]] || continue
+    [[ $cmdline == *"$PLUGIN_DIR"* ]] && continue
+    # This plugin's own scripts, from any install location or older copy
+    # (open chat windows, the panel's refresh), are not NanoClaw either.
+    [[ $cmdline =~ /bin/nanoclaw-(agent|ctl|dash|status|menu|runner|skills|default-agent|integrate)([^a-z-]|$) ]] && continue
+    # Docker CLI watchers (`docker events --filter label=nanoclaw-install=…`)
+    # outlive a stopped service; they are leftovers, not NanoClaw.
+    [[ $cmdline == docker\ * ]] && continue
+    return 0
+  done < <(pgrep -f nanoclaw 2>/dev/null)
+  # The upstream host runs as `node dist/index.js` (or `tsx src/index.ts`) from
+  # inside the checkout, so its argv need not mention nanoclaw at all.
+  if [[ -n $CHECKOUT_DIR ]]; then
+    while read -r pid; do
+      cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null)" || continue
+      [[ $cwd == "$(realpath "$CHECKOUT_DIR")" ]] && return 0
+    done < <(pgrep -f 'dist/index\.js|src/index\.ts' 2>/dev/null)
+  fi
+  return 1
+}
+
+if ! nanoclaw_running; then
+  [[ $SERVICE_STATE == active ]] || note warn "No running NanoClaw process found."
+fi
+
+# --- Containers --------------------------------------------------------------
+CONTAINERS=""
+if [[ -n $RUNTIME ]] && $RUNTIME info >/dev/null 2>&1; then
+  CONTAINERS="$($RUNTIME ps --format '{{.Names}}|{{.Image}}|{{.Status}}' 2>/dev/null | grep -i nanoclaw || true)"
+  if [[ -n $CONTAINERS ]]; then
+    local_count=$(printf '%s\n' "$CONTAINERS" | grep -c .)
+    note ok "$local_count NanoClaw container(s) running."
+  else
+    note warn "No NanoClaw containers running."
+  fi
+  if $RUNTIME images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -qi nanoclaw; then
+    note ok "NanoClaw agent image present."
+  else
+    note warn "NanoClaw agent image not built yet."
+  fi
+fi
+
+# --- Local inference (optional) ---------------------------------------------
+if curl -fsS -m 2 http://localhost:11434/api/tags >/dev/null 2>&1; then
+  note ok "Ollama reachable on :11434."
+elif curl -fsS -m 2 http://localhost:8000/v1/models >/dev/null 2>&1; then
+  note ok "OpenAI-compatible server reachable on :8000."
+else
+  note warn "No local inference server detected (optional; NanoClaw defaults to a cloud provider)."
+fi
+
+# --- Skill provisioning state ---------------------------------------------
+# nanoclaw-skills keeps bookkeeping JSON in state/. A truncated or wrong-shaped
+# file would otherwise be invisible: provisioning would fall back to an empty
+# set while the panel reported a healthy host. Corrupt state is a real fault.
+f="$PLUGIN_DIR/state/skills.json"
+if [[ -f $f ]]; then
+  out="$("$PLUGIN_DIR/bin/nanoclaw-skills" state 2>&1)"; rc=$?
+  if [[ $rc -eq 0 ]]; then
+    note ok "Skill provisioning state: $out"
+  else
+    note fail "Skill provisioning state is corrupt: $out"
+  fi
+fi
+
+# --- Credentials -------------------------------------------------------------
+# Deliberately no key storage. NanoClaw routes credentials through its gateway
+# so agents never hold raw API keys; this plugin must not reintroduce them.
+if [[ -n $CHECKOUT_DIR && -f $CHECKOUT_DIR/.env ]]; then
+  if grep -qE '^(ANTHROPIC|OPENAI|OPENROUTER)_[A-Z_]*=' "$CHECKOUT_DIR/.env" 2>/dev/null; then
+    note warn ".env in the checkout declares provider variables. Upstream expects these to sit with the credential gateway, not the agent."
+  fi
+fi
+note ok "Credentials are owned by the NanoClaw credential gateway; this plugin stores none."
+
+if $JSON; then
+  payload=$(printf '%s\n' "${NOTES[@]}" | python3 -c '
+import sys, json
+rows = [l.rstrip("\n").split("|", 1) for l in sys.stdin if l.strip()]
+print(json.dumps({
+  "checks": [{"level": r[0], "message": r[1]} for r in rows],
+  "summary": {"ok": sum(1 for r in rows if r[0] == "ok"),
+              "warn": sum(1 for r in rows if r[0] == "warn"),
+              "fail": sum(1 for r in rows if r[0] == "fail")},
+  "runtime": sys.argv[1],
+  "checkout": sys.argv[2],
+  "containers": [c for c in sys.argv[3].split("\n") if c],
+}, indent=2))' "$RUNTIME" "$CHECKOUT_DIR" "$CONTAINERS")
+  printf '%s\n' "$payload"
+fi
+
+$PREFLIGHT && [[ $fail -gt 0 ]] && exit 1
+exit 0

@@ -1,0 +1,454 @@
+#!/usr/bin/env bash
+# NanoClaw actions for the Omarchy menu and bar panel.
+#
+# Everything here drives NanoClaw's own tools (nanoclaw.sh, ncl, its Claude
+# Code skills, its systemd user unit); nothing reimplements them. Interactive
+# actions expect to run in a terminal — the menu and panel open one.
+#
+# Usage: nanoclaw-ctl <action> [args]
+#   setup                         resume or repair upstream's guided setup
+#   service start|stop|restart|status|logs
+#   agents                        list agents (ncl groups list)
+#   main [folder]                 make an agent answer the terminal chat (default: first agent)
+#   agent-restart <folder>        restart an agent's containers
+#   agent-delete <folder>         delete an agent (files backed up first)
+#   clean [--yes]                 remove leftovers: disposable agents, orphaned folders,
+#                                 stopped containers, dangling NanoClaw images
+#   templates                     catalog of public templates (* = installed)
+#   template-install <ref>        copy a public template into templates/
+#   template-create [ref] [name]  install if needed, then create an agent from it (no ref: pick one)
+#   disposable [--prompt TEXT]    throwaway agent, deleted when you exit
+#   channel [name]                add a channel (runs /add-<name>; no name: pick one)
+#   provider <name>               add a provider (codex, opencode, ollama-provider)
+#   tasks | approvals             list scheduled tasks / pending approvals
+#   migrate-openclaw              import an OpenClaw setup (/migrate-from-openclaw)
+#   customize                     change NanoClaw with Claude Code (/customize)
+
+set -uo pipefail
+
+PLUGIN_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# Overridable for tests.
+STATE_DIR="${NANOCLAW_STATE_DIR:-$PLUGIN_DIR/state}"
+AGENT_CMD="${NANOCLAW_AGENT_CMD:-$PLUGIN_DIR/bin/nanoclaw-agent}"
+BACKUP_DIR="${NANOCLAW_BACKUP_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/rohirik.nanoclaw/backups}"
+# Upstream code is fetched at these exact commits and checked out detached
+# before anything runs. Bump them deliberately, after testing a newer upstream.
+NANOCLAW_REPO="https://github.com/nanocoai/nanoclaw.git"
+NANOCLAW_REF="d4ff64f49f1defea8c46a3d884d932a1d967e6d9"
+TEMPLATES_REF="7d3cb40409a4a7b8f2cf562b0d80fceb612b941b"
+TEMPLATES_URL="https://codeload.github.com/nanocoai/nanoclaw-templates/tar.gz/$TEMPLATES_REF"
+TEMPLATES_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/rohirik.nanoclaw/templates-${TEMPLATES_REF:0:12}"
+
+die() { printf '\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
+say() { printf '\033[2m%s\033[0m\n' "$*"; }
+
+checkout=""
+for candidate in "${NANOCLAW_PATH:-}" "$HOME/nanoclaw" "$HOME/nanoclaw-v2"; do
+  [[ -n $candidate && -f $candidate/nanoclaw.sh ]] && { checkout="$(realpath "$candidate")"; break; }
+done
+
+need_checkout() { [[ -n $checkout ]] || die "NanoClaw is not installed. Run: nanoclaw-ctl setup"; }
+
+# Upstream's unit name: nanoclaw-v2-<first 8 hex of sha1(checkout path)>.
+unit() { printf 'nanoclaw-v2-%s' "$(printf '%s' "$checkout" | sha1sum | cut -c1-8)"; }
+
+ncl() { need_checkout; "$checkout/bin/ncl" "$@" 2> >(grep -v -e DEP0205 -e trace-deprecation >&2); }
+
+host_up() { [[ -S $checkout/data/ncl.sock ]]; }
+need_host() {
+  need_checkout
+  host_up || die "The NanoClaw service is not running. Start it with: nanoclaw-ctl service start"
+}
+
+# Read-only lookups straight from the central DB; ncl prints tables for
+# humans, and the ids below are only needed to feed back into ncl.
+dbq() {
+  python3 - "$checkout/data/v2.db" "$@" <<'EOF'
+import sqlite3, sys
+db = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+for row in db.execute(sys.argv[2], sys.argv[3:]):
+    print("\t".join("" if v is None else str(v) for v in row))
+EOF
+}
+
+claude_skill() {
+  need_checkout
+  command -v claude >/dev/null || die "Claude Code is needed for NanoClaw's skills."
+  cd "$checkout" && exec claude "/$1"
+}
+
+# One choice from a list, with gum when it is available (Omarchy ships it).
+pick() { # header, then "value<TAB>label" lines on stdin
+  local header="$1" rows choice
+  rows="$(cat)"
+  [[ -n $rows ]] || return 1
+  # Callers capture stdout, so the list is drawn on stderr (as gum does).
+  if command -v gum >/dev/null && [[ -t 2 ]]; then
+    choice="$(cut -f2 <<<"$rows" | gum choose --header "$header")" || return 1
+  else
+    echo "$header" >&2
+    local i=1 line
+    while IFS= read -r line; do printf '%3d) %s\n' "$i" "${line#*$'\t'}" >&2; i=$((i + 1)); done <<<"$rows"
+    # The rows arrived on stdin; the answer has to come from the terminal.
+    read -rp "> " i </dev/tty || return 1; choice="$(sed -n "${i}p" <<<"$rows" | cut -f2)"
+  fi
+  [[ -n $choice ]] && awk -F'\t' -v c="$choice" '$2 == c { print $1; exit }' <<<"$rows"
+}
+
+pause() { [[ -t 0 ]] && { printf '\n\033[2mPress Enter to close\033[0m'; read -r _; }; }
+
+# Templates carry MCP server definitions and skills that NanoClaw runs, so the
+# catalog is pinned like NanoClaw itself: the archive of one exact commit,
+# unpacked into a folder named after it. It is data only; nothing here runs it.
+templates_sync() {
+  [[ -f $TEMPLATES_CACHE/index.json ]] && return 0
+  command -v curl >/dev/null || die "curl is required."
+  local tmp
+  tmp="$(mktemp -d)"
+  if curl -fsSL "$TEMPLATES_URL" | tar -xz -C "$tmp" --strip-components=1 && [[ -f $tmp/index.json ]]; then
+    mkdir -p "$(dirname "$TEMPLATES_CACHE")" && rm -rf "$TEMPLATES_CACHE" && mv "$tmp" "$TEMPLATES_CACHE"
+  else
+    rm -rf "$tmp"; die "Could not fetch the template catalog."
+  fi
+}
+
+# Clone NanoClaw at the pinned commit. Its own updater (/update-nanoclaw)
+# takes over afterwards.
+install_nanoclaw() {
+  local dest="$HOME/nanoclaw"
+  [[ -e $dest ]] && die "$dest exists but is not a NanoClaw checkout; move it aside first."
+  command -v git >/dev/null || die "git is required."
+  say "Fetching NanoClaw at commit ${NANOCLAW_REF:0:12}…"
+  git clone -q --no-checkout "$NANOCLAW_REPO" "$dest" || die "Could not clone NanoClaw."
+  git -C "$dest" checkout -q --detach "$NANOCLAW_REF" || die "Pinned NanoClaw commit not found."
+  checkout="$dest"
+}
+
+template_install() {
+  local ref="$1"
+  need_checkout
+  [[ $ref =~ ^[a-z0-9_-]+/[a-z0-9_-]+$ ]] || die "Template refs look like category/name, e.g. sales/sdr"
+  [[ -f $checkout/templates/$ref/plugin.json ]] && { say "Template $ref already installed."; return 0; }
+  templates_sync
+  [[ -f $TEMPLATES_CACHE/$ref/plugin.json ]] || die "No template '$ref'. See: nanoclaw-ctl templates"
+  mkdir -p "$checkout/templates/$(dirname "$ref")"
+  cp -r "$TEMPLATES_CACHE/$ref" "$checkout/templates/$ref"
+  say "Installed template $ref."
+}
+
+disposable() {
+  need_host
+  local prompt=()
+  [[ ${1:-} == --prompt ]] && prompt=(--prompt "${2:-}")
+  # folder and tmp_id stay global: cleanup runs from the EXIT trap, after this
+  # function's locals are gone.
+  local stamp cli_mg main_wiring main_pattern
+  folder="" tmp_id=""
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  folder="tmp-$stamp"
+
+  cli_mg="$(dbq "SELECT id FROM messaging_groups WHERE channel_type='cli' AND platform_id='local'")"
+  [[ -n $cli_mg ]] || die "No terminal channel yet; finish setup first (nanoclaw-ctl setup)."
+
+  say "Creating disposable agent $folder…"
+  ncl groups create --folder "$folder" --name "Disposable $stamp" >/dev/null || die "Could not create the agent."
+  tmp_id="$(dbq "SELECT id FROM agent_groups WHERE folder=?" "$folder")"
+
+  cleanup() {
+    trap - EXIT INT TERM HUP
+    say "Restoring your agents and deleting $folder…"
+    # Unmute every wiring we muted, with the exact pattern it had.
+    local wid pat
+    while IFS=$'\t' read -r wid pat; do
+      [[ -n $wid ]] && ncl wirings update --id "$wid" --engage-pattern "$pat" >/dev/null
+    done <"$STATE_DIR/disposable-muted.tsv"
+    rm -f "$STATE_DIR/disposable-muted.tsv" "$STATE_DIR/disposable.pid"
+    [[ -n $tmp_id ]] && ncl groups delete --id "$tmp_id" >/dev/null
+    docker ps -aq --filter "label=nanoclaw-group-folder=$folder" | xargs -r docker rm -f >/dev/null 2>&1
+    rm -rf "${checkout:?}/groups/$folder" "${checkout:?}/data/v2-sessions/${tmp_id:-none}"
+    say "Done. Nothing from that session was kept."
+  }
+  trap cleanup EXIT INT TERM HUP
+
+  # Mute the terminal channel's other agents for the session: every wired
+  # agent answers a terminal message, and this one should talk alone. The
+  # original patterns are kept on disk so a crash can still be undone.
+  mkdir -p "$STATE_DIR"
+  printf '%s\n%s\n' "$$" "$folder" >"$STATE_DIR/disposable.pid"
+  dbq "SELECT id, COALESCE(engage_pattern, '.') FROM messaging_group_agents
+       WHERE messaging_group_id=? AND agent_group_id<>?" "$cli_mg" "$tmp_id" \
+    >"$STATE_DIR/disposable-muted.tsv"
+  while IFS=$'\t' read -r main_wiring main_pattern; do
+    [[ -n $main_wiring ]] && ncl wirings update --id "$main_wiring" --engage-pattern '(?!)' >/dev/null
+  done <"$STATE_DIR/disposable-muted.tsv"
+
+  ncl wirings create --channel-type cli --platform-id local --agent-group "$folder" \
+    --engage-mode pattern --engage-pattern . >/dev/null || die "Could not connect the agent to the terminal."
+
+  NANOCLAW_AGENT_LABEL="disposable" "$AGENT_CMD" "${prompt[@]}"
+}
+
+# A previous disposable session that died without cleanup leaves the main
+# agent muted; undo that before anything else touches the wirings.
+recover_muted() {
+  local f="$STATE_DIR/disposable-muted.tsv" wid pat
+  [[ -s $f ]] && host_up || return 0
+  # Wait only while the session that wrote the record is alive. Matching on
+  # command lines also caught the wrapper shell of a session that had died.
+  local pid
+  pid="$(head -n1 "$STATE_DIR/disposable.pid" 2>/dev/null)"
+  [[ -n $pid ]] && grep -qs "nanoclaw-ctl" "/proc/$pid/cmdline" && return 0
+  while IFS=$'\t' read -r wid pat; do
+    [[ -n $wid ]] && ncl wirings update --id "$wid" --engage-pattern "$pat" >/dev/null
+  done <"$f"
+  rm -f "$f" "$STATE_DIR/disposable.pid"
+}
+
+# Tar a directory into BACKUP_DIR before it is removed; prints the archive.
+backup_dir() { # dir label
+  [[ -d $1 ]] || return 0
+  mkdir -p "$BACKUP_DIR"
+  local out="$BACKUP_DIR/$2-$(date +%Y%m%d-%H%M%S).tar.gz"
+  tar -czf "$out" -C "$(dirname "$1")" "$(basename "$1")" && printf '%s\n' "$out"
+}
+
+live_disposable_folder() {
+  local pid
+  pid="$(head -n1 "$STATE_DIR/disposable.pid" 2>/dev/null)"
+  [[ -n $pid ]] && grep -qs "nanoclaw-ctl" "/proc/$pid/cmdline" && sed -n 2p "$STATE_DIR/disposable.pid"
+}
+
+clean() {
+  need_checkout
+  local yes=false; [[ ${1:-} == --yes ]] && yes=true
+  local slug live db="$checkout/data/v2.db"
+  slug="$(unit)"; slug="${slug#nanoclaw-v2-}"
+  live="$(live_disposable_folder)"
+
+  local -a tmp_agents=() orphans=() containers=() images=()
+  local -A known_folder=() known_id=()
+  local id folder d
+  if [[ -f $db ]]; then
+    while IFS=$'\t' read -r id folder; do
+      [[ -n $id ]] || continue
+      known_folder[$folder]=1; known_id[$id]=1
+      [[ $folder == tmp-* && $folder != "$live" ]] && tmp_agents+=("$id"$'\t'"$folder")
+    done < <(dbq "SELECT id, folder FROM agent_groups")
+  fi
+  for d in "$checkout"/groups/*/; do
+    [[ -d $d ]] || continue; d="${d%/}"
+    [[ -z ${known_folder[$(basename "$d")]:-} && $(basename "$d") != "$live" ]] && orphans+=("$d")
+  done
+  for d in "$checkout"/data/v2-sessions/*/; do
+    [[ -d $d ]] || continue; d="${d%/}"
+    [[ -z ${known_id[$(basename "$d")]:-} ]] && orphans+=("$d")
+  done
+  if command -v docker >/dev/null; then
+    mapfile -t containers < <(
+      docker ps -a --filter "label=nanoclaw-install=$slug" --filter status=exited --filter status=created \
+        --filter status=dead --format '{{.ID}}\t{{.Names}}\t{{.Status}}' 2>/dev/null
+      docker ps -a --filter "name=^ncl-bench-" --format '{{.ID}}\t{{.Names}}\t{{.Status}}' 2>/dev/null)
+    mapfile -t images < <(docker images --filter dangling=true --filter label=dev.nanoclaw.image-source \
+      --format '{{.ID}}\t{{.CreatedSince}}\t{{.Size}}' 2>/dev/null)
+  fi
+  # NanoClaw's service leaves its `docker events`/`docker ps` watchers running
+  # when it stops; only collect them while the service is down.
+  local -a watchers=()
+  if [[ $(systemctl --user is-active "$(unit)" 2>/dev/null) != active ]]; then
+    local pid
+    while read -r pid; do
+      [[ -n $pid ]] && [[ $(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) == docker\ * ]] && watchers+=("$pid")
+    done < <(pgrep -u "$UID" -f "nanoclaw-install=$slug" 2>/dev/null)
+  fi
+  local stale_mute=""
+  [[ -s $STATE_DIR/disposable-muted.tsv && -z $live ]] && stale_mute=1
+
+  local total=$(( ${#tmp_agents[@]} + ${#orphans[@]} + ${#containers[@]} + ${#images[@]} + ${#watchers[@]} ))
+  [[ -n $stale_mute ]] && total=$((total + 1))
+  if ((total == 0)); then say "Nothing to clean."; return 0; fi
+
+  echo "Found:"
+  local row
+  for row in "${tmp_agents[@]}"; do printf '  disposable agent   %s (not in use)\n' "${row#*$'\t'}"; done
+  for row in "${orphans[@]}"; do printf '  orphaned folder    %s  (backed up first)\n' "${row#"$checkout"/}"; done
+  for row in "${containers[@]}"; do [[ -n $row ]] && printf '  container          %s\n' "$(cut -f2- <<<"$row" | tr '\t' ' ')"; done
+  for row in "${images[@]}"; do [[ -n $row ]] && printf '  dangling image     %s\n' "$(tr '\t' ' ' <<<"$row")"; done
+  for row in "${watchers[@]}"; do printf '  leftover watcher   pid %s: %s\n' "$row" "$(tr '\0' ' ' <"/proc/$row/cmdline" | cut -c1-70)"; done
+  [[ -n $stale_mute ]] && echo "  muted agents from a crashed disposable session (will be unmuted)"
+  echo "Your real agents, their memory, OneCLI and its credentials are never touched."
+
+  if ! $yes; then
+    read -rp "Clean these up? [y/N] " a
+    [[ ${a,,} == y* ]] || { echo "Nothing changed."; return 1; }
+  fi
+
+  if [[ -n $stale_mute ]]; then
+    if host_up; then recover_muted; else say "Start the service to unmute agents (skipped)."; fi
+  fi
+  for row in "${tmp_agents[@]}"; do
+    id="${row%%$'\t'*}"; folder="${row#*$'\t'}"
+    if host_up; then
+      ncl groups delete --id "$id" >/dev/null && say "Deleted disposable agent $folder."
+    else
+      say "Service stopped: $folder stays registered until the next clean with the service running."
+      continue
+    fi
+    docker ps -aq --filter "label=nanoclaw-group-folder=$folder" | xargs -r docker rm -f >/dev/null 2>&1
+    rm -rf "${checkout:?}/groups/$folder" "${checkout:?}/data/v2-sessions/$id"
+  done
+  for d in "${orphans[@]}"; do
+    out="$(backup_dir "$d" "orphan-$(basename "$d")")" && rm -rf "${d:?}" && say "Moved $(basename "$d") to $out"
+  done
+  for row in "${containers[@]}"; do [[ -n $row ]] && docker rm -f "${row%%$'\t'*}" >/dev/null 2>&1; done
+  for row in "${images[@]}"; do [[ -n $row ]] && docker rmi "${row%%$'\t'*}" >/dev/null 2>&1; done
+  ((${#watchers[@]})) && kill "${watchers[@]}" 2>/dev/null
+  say "Clean."
+}
+
+action="${1:-}"; shift || true
+[[ -n $checkout && $action != disposable ]] && recover_muted
+
+case "$action" in
+  setup)
+    fresh=false
+    if [[ -z $checkout ]]; then
+      echo "NanoClaw is not installed. This clones github.com/nanocoai/nanoclaw to ~/nanoclaw"
+      echo "and runs its guided setup (Node, pnpm, Docker checks, credential gateway, sign-in)."
+      read -rp "Continue? [Y/n] " a
+      [[ ${a,,} == n* ]] && exit 1
+      install_nanoclaw; fresh=true
+    fi
+    cd "$checkout" && bash nanoclaw.sh
+    rc=$?
+    # A fresh clone is detached at the pinned commit; give upstream's updater
+    # the tracking branch it expects.
+    if $fresh && ((rc == 0)); then
+      git checkout -q -B main && git branch -q --set-upstream-to=origin/main main 2>/dev/null
+    fi
+    pause; exit $rc
+    ;;
+  service)
+    need_checkout
+    case "${1:-status}" in
+      start|stop|restart) systemctl --user "$1" "$(unit)" && say "Service $1: ok"; rc=$?; pause; exit $rc ;;
+      status) systemctl --user status "$(unit)" --no-pager; pause ;;
+      logs) exec journalctl --user -u "$(unit)" -f -n 200 ;;
+      *) die "service start|stop|restart|status|logs" ;;
+    esac
+    ;;
+  agents) need_host; ncl groups list; pause ;;
+  clean) clean "$@"; rc=$?; pause; exit $rc ;;
+  main)
+    # Setup removes its scratch terminal agent once a template agent exists but
+    # does not wire that agent to the terminal, which leaves Chat unanswered.
+    need_host
+    folder="${1:-$(dbq "SELECT folder FROM agent_groups WHERE folder NOT LIKE 'tmp-%' ORDER BY created_at LIMIT 1")}"
+    [[ -n $folder ]] || die "No agent to connect; create one first."
+    cli_mg="$(dbq "SELECT id FROM messaging_groups WHERE channel_type='cli' AND platform_id='local'")"
+    [[ -n $cli_mg ]] || die "No terminal channel; run: nanoclaw-ctl setup"
+    wid="$(dbq "SELECT mga.id FROM messaging_group_agents mga JOIN agent_groups ag ON ag.id=mga.agent_group_id
+                WHERE mga.messaging_group_id=? AND ag.folder=?" "$cli_mg" "$folder")"
+    if [[ -n $wid ]]; then
+      ncl wirings update --id "$wid" --engage-mode pattern --engage-pattern . >/dev/null
+    else
+      ncl wirings create --channel-type cli --platform-id local --agent-group "$folder" \
+        --engage-mode pattern --engage-pattern . >/dev/null
+    fi && say "$folder now answers the terminal chat."
+    ;;
+  agent-restart)
+    need_host; [[ -n ${1:-} ]] || die "agent-restart <folder>"
+    id="$(dbq "SELECT id FROM agent_groups WHERE folder=?" "$1")"; [[ -n $id ]] || die "No agent '$1'"
+    ncl groups restart --id "$id"; pause
+    ;;
+  agent-delete)
+    need_host; [[ -n ${1:-} ]] || die "agent-delete <folder>"
+    id="$(dbq "SELECT id FROM agent_groups WHERE folder=?" "$1")"; [[ -n $id ]] || die "No agent '$1'"
+    echo "This deletes agent '$1' with its memory, conversations and tasks."
+    echo "Its files are backed up to $BACKUP_DIR first."
+    read -rp "Type the agent name ($1) to confirm: " a
+    [[ $a == "$1" ]] || { echo "Not deleted."; pause; exit 1; }
+    backup_dir "$checkout/groups/$1" "agent-$1" >/dev/null
+    backup_dir "$checkout/data/v2-sessions/$id" "sessions-$1" >/dev/null
+    ncl groups delete --id "$id" && {
+      docker ps -aq --filter "label=nanoclaw-group-folder=$1" | xargs -r docker rm -f >/dev/null 2>&1
+      rm -rf "${checkout:?}/groups/$1" "${checkout:?}/data/v2-sessions/$id"
+      say "Deleted $1."
+    }
+    pause
+    ;;
+  templates)
+    templates_sync
+    python3 - "$TEMPLATES_CACHE/index.json" "${checkout:-/nonexistent}/templates" <<'EOF'
+import json, os, sys
+idx = json.load(open(sys.argv[1]))
+for cat, items in idx["categories"].items():
+    for t in items:
+        mark = "*" if os.path.isfile(os.path.join(sys.argv[2], t["ref"], "plugin.json")) else " "
+        print(f"{mark} {t['ref']:<30} {t['description']}")
+EOF
+    [[ -t 0 ]] && printf '\nCreate an agent: nanoclaw-ctl template-create <ref>\n'
+    pause
+    ;;
+  template-install) template_install "${1:?template-install <ref>}"; pause ;;
+  template-create)
+    need_host
+    ref="${1:-}"
+    if [[ -z $ref ]]; then
+      templates_sync
+      ref="$(python3 - "$TEMPLATES_CACHE/index.json" <<'EOF' | pick "Create an agent from a template"
+import json, sys
+for items in json.load(open(sys.argv[1]))["categories"].values():
+    for t in items:
+        print(f"{t['ref']}\t{t['ref']:<28} {t['description'][:70]}")
+EOF
+)" || exit 1
+    fi
+    template_install "$ref" || exit 1
+    args=(groups create --template "$ref")
+    [[ -n ${2:-} ]] && args+=(--name "$2")
+    ncl "${args[@]}"; pause
+    ;;
+  disposable) disposable "$@" ;;
+  channel)
+    if [[ -z ${1:-} ]]; then
+      need_checkout
+      # Messaging channels only (other add-* skills are providers and tools),
+      # offered when this NanoClaw version ships the skill.
+      set -- "$(while IFS=: read -r n label; do
+                  [[ -d $checkout/.claude/skills/add-$n ]] && printf '%s\t%s\n' "$n" "$label"
+                done <<'EOF' | pick "Add a channel"
+telegram:Telegram
+whatsapp:WhatsApp
+whatsapp-cloud:WhatsApp Cloud API
+discord:Discord
+slack:Slack
+signal:Signal
+matrix:Matrix
+teams:Microsoft Teams
+gchat:Google Chat
+mattermost:Mattermost
+webex:Webex
+wechat:WeChat
+deltachat:Delta Chat
+imessage:iMessage (macOS)
+resend:Email (Resend)
+github:GitHub
+linear:Linear
+EOF
+)" || exit 1
+    fi
+    [[ ${1:-} =~ ^[a-z0-9-]+$ ]] || die "channel <name>, e.g. telegram"
+    [[ -d $checkout/.claude/skills/add-$1 ]] || die "No channel skill add-$1"
+    claude_skill "add-$1"
+    ;;
+  provider)
+    [[ ${1:-} =~ ^(codex|opencode|ollama-provider)$ ]] || die "provider codex|opencode|ollama-provider"
+    claude_skill "add-$1"
+    ;;
+  tasks) need_host; ncl tasks list; pause ;;
+  approvals) need_host; ncl approvals list; pause ;;
+  migrate-openclaw) claude_skill "migrate-from-openclaw" ;;
+  customize) claude_skill "customize" ;;
+  -h|--help|"") sed -n '2,22p' "$0" ;;
+  *) die "Unknown action: $action (see nanoclaw-ctl --help)" ;;
+esac

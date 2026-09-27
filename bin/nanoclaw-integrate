@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# Optional desktop integration for the NanoClaw plugin.
+#
+# The bar widget works on its own. This adds the rest, one part at a time and
+# only after you agree to each:
+#
+#   menu      NanoClaw submenu under Setup, and NanoClaw in Setup > Agent
+#   agent     route Super+Shift+Ctrl+A and the `a` alias through NanoClaw's
+#             dispatcher, so NanoClaw can be the default agent
+#   app       NanoClaw in Apps and the app launcher, with its icon
+#   commands  `nanoclaw-ctl` and NanoClaw's `ncl` on your PATH (~/.local/bin)
+#   skill     the NanoClaw management skill for Claude Code, Codex and Hermes
+#
+# Text is added only between "rohirik.nanoclaw" marker lines, every edited file
+# is backed up first, and each change is recorded in state/integrations, so
+# `remove` takes out exactly what `install` put in and nothing else.
+#
+# Usage: nanoclaw-integrate install [part...] [--yes]
+#        nanoclaw-integrate remove  [part...] [--yes]
+#        nanoclaw-integrate status
+
+set -uo pipefail
+
+PLUGIN_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+ID="rohirik.nanoclaw"
+STATE="${NANOCLAW_STATE_DIR:-$PLUGIN_DIR/state}/integrations"
+CFG="${XDG_CONFIG_HOME:-$HOME/.config}"
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
+MENU="$CFG/omarchy/extensions/omarchy-menu.jsonc"
+BINDINGS="$CFG/hypr/bindings.lua"
+BASHRC="$HOME/.bashrc"
+DESKTOP="$DATA/applications/$ID.desktop"
+ICON="$DATA/icons/hicolor/256x256/apps/$ID.png"
+FONT="$DATA/fonts/NanoClawIcons.ttf"
+BIN="$HOME/.local/bin"
+ALL_PARTS=(menu agent app commands skill)
+
+YES=false
+say() { printf '\033[2m%s\033[0m\n' "$*"; }
+ok()  { printf '\033[32m✓\033[0m %s\n' "$*"; }
+
+ask() { # question
+  $YES && return 0
+  if [[ -t 0 ]] && command -v gum >/dev/null; then gum confirm "$1"; return; fi
+  local a; read -rp "$1 [y/N] " a; [[ ${a,,} == y* ]]
+}
+
+record()   { mkdir -p "$(dirname "$STATE")"; grep -qxF "$1" "$STATE" 2>/dev/null || echo "$1" >>"$STATE"; }
+unrecord() { [[ -f $STATE ]] && { grep -vxF "$1" "$STATE" >"$STATE.tmp"; mv "$STATE.tmp" "$STATE"; }; return 0; }
+has()      { grep -qxF "$1" "$STATE" 2>/dev/null; }
+
+backup() { [[ -f $1 ]] && cp -p "$1" "$1.bak.$ID.$(date +%Y%m%d-%H%M%S)"; return 0; }
+
+# Replace, insert or append the block between "<c> >>> ID" and "<c> <<< ID".
+# The block is always whole lines of its own; nothing of yours is edited, so
+# removing it restores the file exactly.
+put_block() { # file comment-prefix content [json]
+  local file="$1" c="$2" content="$3" json="${4:-}"
+  mkdir -p "$(dirname "$file")"; [[ -f $file ]] || { [[ -n $json ]] && printf '{\n}\n' >"$file" || : >"$file"; }
+  backup "$file"
+  BLOCK="$content" python3 - "$file" "$c" "$ID" "$json" <<'PY'
+import os, re, sys
+path, c, ident, json = sys.argv[1:5]
+body = os.environ["BLOCK"].rstrip("\n")
+text = open(path).read()
+start, end = f"{c} >>> {ident}", f"{c} <<< {ident}"
+block = f"{start}\n{body}\n{end}\n"
+pat = re.compile(rf"^[ \t]*{re.escape(start)}\n.*?^[ \t]*{re.escape(end)}\n", re.S | re.M)
+if pat.search(text):
+    text = pat.sub(lambda m: block, text, count=1)
+elif json:
+    # Right after the opening brace: every entry of ours ends with a comma, and
+    # Omarchy's parser drops a trailing one if the menu has nothing else.
+    m = re.search(r"^[ \t]*\{[^\n]*\n", text, re.M)
+    if not m:
+        sys.exit("no opening brace in " + path)
+    text = text[:m.end()] + block + text[m.end():]
+else:
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += ("\n" if text else "") + block
+open(path, "w").write(text)
+PY
+}
+
+drop_block() { # file comment-prefix
+  [[ -f $1 ]] || return 0
+  grep -qF -e "$2 >>> $ID" "$1" || return 0
+  backup "$1"
+  python3 - "$1" "$2" "$ID" <<'PY'
+import re, sys
+path, c, ident = sys.argv[1:4]
+text = open(path).read()
+# The blank line an append put before the block goes with it.
+pat = re.compile(rf"(?:^\n)?^[ \t]*{re.escape(c)} >>> {re.escape(ident)}\n.*?^[ \t]*{re.escape(c)} <<< {re.escape(ident)}\n", re.S | re.M)
+open(path, "w").write(pat.sub("", text, count=1))
+PY
+}
+
+link() { # target link
+  mkdir -p "$(dirname "$2")"
+  if [[ -e $2 && ! -L $2 ]]; then say "Skipped $2: a file you own is already there."; return 1; fi
+  ln -sfn "$1" "$2"
+}
+unlink_ours() { [[ -L $1 && $(readlink "$1") == "$PLUGIN_DIR"* ]] && rm -f "$1"; return 0; }
+
+# --- parts -------------------------------------------------------------------
+
+install_menu() {
+  ask "Add NanoClaw to the Omarchy menu (Setup > NanoClaw, Setup > Agent)?" || return 0
+  local entries
+  entries="$(sed -e '/^\s*\/\//d' -e '/^[{}]\s*$/d' -e "s|@PLUGIN@|$PLUGIN_DIR|g" "$PLUGIN_DIR/menu.jsonc")"
+  put_block "$MENU" "  //" "$entries" json || return 1
+  # The menu shows the NanoClaw mark only if the font is known to fontconfig.
+  link "$PLUGIN_DIR/assets/NanoClawIcons.ttf" "$FONT" && command -v fc-cache >/dev/null && fc-cache -f "$(dirname "$FONT")" >/dev/null 2>&1
+  command -v omarchy-menu >/dev/null && omarchy-menu refresh >/dev/null 2>&1
+  record menu; ok "Menu: Setup > NanoClaw (restart the shell once for its icon: omarchy restart shell)"
+}
+remove_menu() { drop_block "$MENU" "  //"; unlink_ours "$FONT"; command -v omarchy-menu >/dev/null && omarchy-menu refresh >/dev/null 2>&1; unrecord menu; ok "Menu entries removed"; }
+
+install_agent() {
+  ask "Let NanoClaw be your default agent (reroutes Super+Shift+Ctrl+A and the 'a' alias through NanoClaw; other agents still work)?" || return 0
+  local d="$PLUGIN_DIR/bin/nanoclaw-default-agent"
+  if [[ -f $BINDINGS ]]; then
+    put_block "$BINDINGS" "--" "hl.unbind(\"SUPER + SHIFT + CTRL + A\")
+o.bind(\"SUPER + SHIFT + CTRL + A\", \"Agent\", \"$d launch --pick\")"
+    command -v hyprctl >/dev/null && hyprctl reload >/dev/null 2>&1
+  fi
+  put_block "$BASHRC" "#" "alias a='$d launch --inline'"
+  record agent; ok "Default agent: pick Setup > Agent > NanoClaw to use it (needs the menu part)"
+}
+remove_agent() {
+  drop_block "$BINDINGS" "--"; drop_block "$BASHRC" "#"
+  command -v hyprctl >/dev/null && hyprctl reload >/dev/null 2>&1
+  unrecord agent; ok "Keybinding and alias restored"
+}
+
+install_app() {
+  ask "Add NanoClaw to Apps and the app launcher?" || return 0
+  local t="omarchy-launch-floating-terminal-with-presentation"
+  link "$PLUGIN_DIR/assets/nanoclaw-app.png" "$ICON" || return 1
+  mkdir -p "$(dirname "$DESKTOP")"
+  cat >"$DESKTOP" <<EOF
+[Desktop Entry]
+Type=Application
+Name=NanoClaw
+GenericName=AI Assistant
+Comment=Chat with your self-hosted NanoClaw agent
+Exec=omarchy-launch-tui --app-id=org.omarchy.agent $PLUGIN_DIR/bin/nanoclaw-agent
+Icon=$ID
+Terminal=false
+Categories=Utility;
+Keywords=ai;agent;assistant;claw;ncl;
+Actions=dashboard;disposable;clean;
+
+[Desktop Action dashboard]
+Name=Dashboard
+Exec=omarchy-shell $ID open
+
+[Desktop Action disposable]
+Name=Disposable agent
+Exec=$t $PLUGIN_DIR/bin/nanoclaw-ctl disposable
+
+[Desktop Action clean]
+Name=Clean up
+Exec=$t $PLUGIN_DIR/bin/nanoclaw-ctl clean
+EOF
+  command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q "$DATA/icons/hicolor" 2>/dev/null
+  command -v update-desktop-database >/dev/null && update-desktop-database -q "$(dirname "$DESKTOP")" 2>/dev/null
+  record app; ok "App entry: NanoClaw in Apps"
+}
+remove_app() { rm -f "$DESKTOP"; unlink_ours "$ICON"; unrecord app; ok "App entry removed"; }
+
+install_commands() {
+  ask "Put nanoclaw-ctl and NanoClaw's ncl on your PATH (~/.local/bin)?" || return 0
+  link "$PLUGIN_DIR/bin/nanoclaw-ctl" "$BIN/nanoclaw-ctl"
+  local co="${NANOCLAW_PATH:-$HOME/nanoclaw}"
+  [[ -x $co/bin/ncl ]] && link "$co/bin/ncl" "$BIN/ncl" && record "ncl:$co/bin/ncl"
+  record commands; ok "Commands: nanoclaw-ctl$([[ -x $co/bin/ncl ]] && echo ", ncl")"
+}
+remove_commands() {
+  unlink_ours "$BIN/nanoclaw-ctl"
+  local r; r="$(grep '^ncl:' "$STATE" 2>/dev/null | head -1)"
+  [[ -n $r && -L $BIN/ncl && $(readlink "$BIN/ncl") == "${r#ncl:}" ]] && rm -f "$BIN/ncl" && unrecord "$r"
+  unrecord commands; ok "Commands removed"
+}
+
+install_skill() {
+  ask "Install the NanoClaw management skill for your AI agents (Claude Code, Codex, Hermes)?" || return 0
+  local d n=0
+  for d in "$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.hermes/skills"; do
+    [[ -d $d ]] || continue
+    link "$PLUGIN_DIR/skills/nanoclaw" "$d/nanoclaw" && n=$((n + 1))
+  done
+  record skill; ok "Skill linked into $n agent(s)"
+}
+remove_skill() {
+  local d
+  for d in "$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.hermes/skills"; do unlink_ours "$d/nanoclaw"; done
+  unrecord skill; ok "Skill links removed"
+}
+
+# --- main --------------------------------------------------------------------
+
+action="${1:-}"; shift || true
+parts=()
+for a in "$@"; do
+  case "$a" in
+    --yes|-y) YES=true ;;
+    menu|agent|app|commands|skill) parts+=("$a") ;;
+    *) echo "Unknown part: $a" >&2; exit 2 ;;
+  esac
+done
+((${#parts[@]})) || parts=("${ALL_PARTS[@]}")
+
+case "$action" in
+  install)
+    if command -v gum >/dev/null && [[ -t 1 ]]; then
+      gum style --border rounded --padding "0 2" --border-foreground 6 "NanoClaw desktop integration" "Each part asks first. Undo any time: nanoclaw-integrate remove"
+    fi
+    for p in "${parts[@]}"; do "install_$p"; done
+    ;;
+  remove)
+    for p in "${parts[@]}"; do has "$p" && "remove_$p"; done
+    ;;
+  status)
+    for p in "${ALL_PARTS[@]}"; do has "$p" && ok "$p" || printf '  %s (not installed)\n' "$p"; done
+    ;;
+  *) sed -n '2,21p' "$0"; exit 2 ;;
+esac
