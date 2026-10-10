@@ -88,6 +88,30 @@ The OneCLI credential gateway (its own Docker containers) holds provider
 credentials; agents never see raw keys. Don't write API keys into `.env` or a
 group folder — re-run `nanoclaw-ctl setup` or the relevant `/add-*` skill.
 
+## Free OpenCode (no Zen key)
+
+The full `opencode serve` CLI can use native free models through OneCLI without a real Zen key. Keep OneCLI's protection enabled; do not add fake secrets or disable authentication globally.
+
+Required adapter support: preserve `OPENCODE_AUTH_MODE=anonymous` in the host provider, and omit `provider.opencode.options.apiKey` in anonymous mode while preserving `options.baseURL`. Reject missing/non-free main models, non-free small models and other providers rather than falling back to authenticated/paid requests. A `-free` name is only a configuration guard: independently verify current pricing.
+
+Set these non-secret values through NanoClaw's host env setup helper:
+
+```text
+OPENCODE_PROVIDER=opencode
+OPENCODE_MODEL=opencode/fledge-alpha-free
+OPENCODE_SMALL_MODEL=opencode/fledge-alpha-free
+OPENCODE_BASE_URL=https://opencode.ai/zen/v1
+OPENCODE_AUTH_MODE=anonymous
+```
+
+Set the specific group's provider/model through `ncl groups config update --id <id> --provider opencode --model opencode/fledge-alpha-free`. Build the host after provider changes and restart its service. Runner source is mounted at spawn: no full image rebuild is needed for this source-only change. `groups restart --rebuild` is a group package-install path and can refuse if no packages are pending.
+
+Verify an actual fresh external reply from that Claw using native session history. A host-only OpenCode diagnostic is not proof of container success. Separately verify coding tools and Git delivery before claiming a working development/review loop. Never enter the container or inspect its live workspace.
+
+OneCLI can rewrite an upstream 401/403 into generic missing-credential advice. That message alone does not establish a key requirement. An adapter's dummy apiKey can suppress OpenCode's native keyless behavior.
+
+Test configuration in an isolated source testbed: Bun auto-loads the checkout's `.env`, which can contaminate tests expecting unset provider variables. Preserve existing authenticated-provider and modality regression checks.
+
 ## Host-agent skill provisioning (separate concern)
 
 `nanoclaw-skills` links Omarchy's stock skills (and optionally personal ones)
