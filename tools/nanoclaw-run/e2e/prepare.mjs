@@ -1,22 +1,132 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import {parseArgs} from 'node:util';
-import {randomUUID,createHash} from 'node:crypto';
-import {fileURLToPath} from 'node:url';
-const {values}=parseArgs({options:{'site-worktree':{type:'string'},source:{type:'string'},manifest:{type:'string'},'template-root':{type:'string'}}});
-for(const key of ['site-worktree','source','manifest','template-root'])if(!values[key])throw new Error('Required --'+key);
-const own=path.dirname(fileURLToPath(import.meta.url));
-const stamp=new Date().toISOString().replaceAll(/[^0-9]/g,'').slice(0,14)+'-'+randomUUID().slice(0,8);
-const base=path.join(path.resolve(values['site-worktree']),'.audit','nanoclaw-lifecycle-e2e',stamp);fs.mkdirSync(base,{recursive:true,mode:0o700});
-const control=path.join(base,'input','control');fs.mkdirSync(control,{recursive:true,mode:0o700});
-for(const name of ['qualify.mjs','network-guard.cjs'])fs.copyFileSync(path.join(own,name),path.join(control,name));
-const ref='engineering/nanoclaw-run-qualification';const template=path.join(path.resolve(values['template-root']),ref);
-const templateFiles={
- 'plugin.json':JSON.stringify({$schema:'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json',name:'nanoclaw-run-qualification',version:'1.0.0',description:'Single-instance purpose/monitor/recover qualification',extensions:{'ai.nanoco.nanoclaw':{agentName:'NanoClaw Run Qualification'}}},null,2)+'\n',
- 'ai.nanoco.nanoclaw/context/instructions.md':'# Bounded native run executor\n\nExecute only the commissioned purpose. Read-only source/control mounts, writable owned sandbox, no credentials or real external side effects. No delegation, self-scheduling, config edits or source fixes. Task supplies a run/attempt-bound native export contract. Use the supplied harness, not fabricated reports. The owner deliberately tests a withheld report on the first attempt: preserve that negative control, do not fill its missing export manually. A later same-instance recovery re-exports the genuine saved files without rerunning tests. Never echo the serialized export marker in ordinary prose; only the harness emits marked events. Finish with a short actual result.\n'
+import fs from "node:fs";
+import path from "node:path";
+import { parseArgs } from "node:util";
+import { randomUUID, createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
+const { values } = parseArgs({
+  options: {
+    "site-worktree": { type: "string" },
+    source: { type: "string" },
+    manifest: { type: "string" },
+    "template-root": { type: "string" },
+  },
+});
+for (const key of ["site-worktree", "source", "manifest", "template-root"])
+  if (!values[key]) throw new Error("Required --" + key);
+const own = path.dirname(fileURLToPath(import.meta.url));
+const stamp =
+  new Date()
+    .toISOString()
+    .replaceAll(/[^0-9]/g, "")
+    .slice(0, 14) +
+  "-" +
+  randomUUID().slice(0, 8);
+const base = path.join(
+  path.resolve(values["site-worktree"]),
+  ".audit",
+  "nanoclaw-lifecycle-e2e",
+  stamp,
+);
+fs.mkdirSync(base, { recursive: true, mode: 0o700 });
+const control = path.join(base, "input", "control");
+fs.mkdirSync(control, { recursive: true, mode: 0o700 });
+for (const name of ["qualify.mjs", "network-guard.cjs", "tooling.mjs"])
+  fs.copyFileSync(path.join(own, name), path.join(control, name));
+const ref = "engineering/nanoclaw-run-qualification";
+const template = path.join(path.resolve(values["template-root"]), ref);
+const templateFiles = {
+  "plugin.json":
+    JSON.stringify(
+      {
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "nanoclaw-run-qualification",
+        version: "1.0.0",
+        description: "Single-instance purpose/monitor/recover qualification",
+        extensions: {
+          "ai.nanoco.nanoclaw": { agentName: "NanoClaw Run Qualification" },
+        },
+      },
+      null,
+      2,
+    ) + "\n",
+  "ai.nanoco.nanoclaw/context/instructions.md":
+    "# Bounded native run executor\n\nExecute only the commissioned purpose. Read-only source/control mounts, writable owned sandbox, no credentials or real external side effects. No delegation, self-scheduling, config edits or source fixes. Task supplies a run/attempt-bound native export contract. Use the supplied harness, not fabricated reports. The owner deliberately tests a withheld report on the first attempt: preserve that negative control, do not fill its missing export manually. A later same-instance recovery re-exports the genuine saved files without rerunning tests. Never echo the serialized export marker in ordinary prose; only the harness emits marked events. Finish with a short actual result.\n",
 };
-for(const [rel,content] of Object.entries(templateFiles)){const dest=path.join(template,rel);if(fs.existsSync(dest)&&fs.readFileSync(dest,'utf8')!==content)throw new Error('Refusing to overwrite a differing native template: '+dest);fs.mkdirSync(path.dirname(dest),{recursive:true});if(!fs.existsSync(dest))fs.writeFileSync(dest,content,{flag:'wx',mode:0o600});}
-const plan={version:1,purpose:'Qualify the NanoClaw skill/CLI purpose → monitor → diagnose → same-instance artifact recovery using a fresh isolated build/browser/API run of CloudJourneyBlog; not a comprehensive website security audit.',source:{path:path.resolve(values.source),sha:'c3f319da6bc6165b5dc80f4d1582ca2cb3a0edd8',manifest:path.resolve(values.manifest)},controlPath:control,provider:'opencode',model:'opencode/deepseek-v4.1-flash-free',freeOnly:true,templateRef:ref,packages:{apt:['chromium'],npm:['playwright-core@1.58.2']},initialTask:'Read the supplied controls. Run exactly node /workspace/extra/control/qualify.mjs --run-id {{runId}} --attempt {{attempt}} --defer-report . The first attempt deliberately saves but does not export report.md. Do not emit extra marked events, do not fill that deliberate gap, do not edit harness/source. Wait for real execution/exit; finish with ordinary short prose only.',exportTask:'Read the supplied controls. Run exactly node /workspace/extra/control/qualify.mjs --run-id {{runId}} --attempt {{attempt}} --export-only . This must re-export the actual previously saved files in this same instance, not rerun build/browser/API. No extra marked events or invented replacement reports. Finish with ordinary short prose only.',artifacts:[{name:'e2e.json',type:'json',minBytes:500,checks:[{pointer:'/sourceSha',equals:'c3f319da6bc6165b5dc80f4d1582ca2cb3a0edd8'},{pointer:'/freshAppCopy',equals:true},{pointer:'/browser/realChromium',equals:true},{pointer:'/browser/status',equals:200},{pointer:'/browser/pageErrors',equals:[]},{pointer:'/api/crossOriginStatus',equals:403},{pointer:'/api/unsupportedContentTypeStatus',equals:415},{pointer:'/api/validMockedContactStatus',equals:200},{pointer:'/api/realEmailsSent',equals:0}]},{name:'browser.jpg',type:'jpeg',minBytes:1000,checks:[]},{name:'report.md',type:'text',minBytes:300,checks:[]}]};
-const planPath=path.join(base,'plan.json');fs.writeFileSync(planPath,JSON.stringify(plan,null,2)+'\n',{mode:0o600});
-const prepared={base,run:path.join(base,'run'),plan:planPath,template,control,controlHashes:Object.fromEntries(['qualify.mjs','network-guard.cjs'].map(n=>[n,createHash('sha256').update(fs.readFileSync(path.join(control,n))).digest('hex')]))};fs.writeFileSync(path.join(base,'PREPARED.json'),JSON.stringify(prepared,null,2)+'\n',{mode:0o600});
-console.log(JSON.stringify(prepared,null,2));
+for (const [rel, content] of Object.entries(templateFiles)) {
+  const dest = path.join(template, rel);
+  if (fs.existsSync(dest) && fs.readFileSync(dest, "utf8") !== content)
+    throw new Error(
+      "Refusing to overwrite a differing native template: " + dest,
+    );
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  if (!fs.existsSync(dest))
+    fs.writeFileSync(dest, content, { flag: "wx", mode: 0o600 });
+}
+const plan = {
+  version: 1,
+  purpose:
+    "Qualify the NanoClaw skill/CLI purpose → monitor → diagnose → same-instance artifact recovery using a fresh isolated build/browser/API run of CloudJourneyBlog; not a comprehensive website security audit.",
+  source: {
+    path: path.resolve(values.source),
+    sha: "c3f319da6bc6165b5dc80f4d1582ca2cb3a0edd8",
+    manifest: path.resolve(values.manifest),
+  },
+  controlPath: control,
+  provider: "opencode",
+  model: "opencode/deepseek-v4.1-flash-free",
+  freeOnly: true,
+  templateRef: ref,
+  packages: { apt: ["chromium"], npm: ["playwright-core@1.58.2"] },
+  initialTask:
+    "Read the supplied controls. Run exactly node /workspace/extra/control/qualify.mjs --run-id {{runId}} --attempt {{attempt}} --defer-report . The execution deliberately saves but does not export report.md. Run this producer ONCE only. On any error, stop and report it; do not repair prerequisites, remove outputs/markers, or rerun in this attempt. The host commissions recovery after terminal diagnosis. Do not emit extra marked events, do not fill that deliberate gap, do not edit harness/source. Wait for real execution/exit; finish with ordinary short prose only.",
+  exportTask:
+    "Read the supplied controls. Run exactly node /workspace/extra/control/qualify.mjs --run-id {{runId}} --attempt {{attempt}} --export-only . This must re-export the actual previously saved files in this same instance, not rerun build/browser/API. No extra marked events or invented replacement reports. Finish with ordinary short prose only.",
+  artifacts: [
+    {
+      name: "e2e.json",
+      type: "json",
+      minBytes: 500,
+      checks: [
+        {
+          pointer: "/sourceSha",
+          equals: "c3f319da6bc6165b5dc80f4d1582ca2cb3a0edd8",
+        },
+        { pointer: "/freshAppCopy", equals: true },
+        { pointer: "/browser/realChromium", equals: true },
+        { pointer: "/browser/status", equals: 200 },
+        { pointer: "/browser/pageErrors", equals: [] },
+        { pointer: "/api/crossOriginStatus", equals: 403 },
+        { pointer: "/api/unsupportedContentTypeStatus", equals: 415 },
+        { pointer: "/api/validMockedContactStatus", equals: 200 },
+        { pointer: "/api/realEmailsSent", equals: 0 },
+      ],
+    },
+    { name: "browser.jpg", type: "jpeg", minBytes: 1000, checks: [] },
+    { name: "report.md", type: "text", minBytes: 300, checks: [] },
+  ],
+};
+const planPath = path.join(base, "plan.json");
+fs.writeFileSync(planPath, JSON.stringify(plan, null, 2) + "\n", {
+  mode: 0o600,
+});
+const prepared = {
+  base,
+  run: path.join(base, "run"),
+  plan: planPath,
+  template,
+  control,
+  controlHashes: Object.fromEntries(
+    ["qualify.mjs", "network-guard.cjs", "tooling.mjs"].map((n) => [
+      n,
+      createHash("sha256")
+        .update(fs.readFileSync(path.join(control, n)))
+        .digest("hex"),
+    ]),
+  ),
+};
+fs.writeFileSync(
+  path.join(base, "PREPARED.json"),
+  JSON.stringify(prepared, null, 2) + "\n",
+  { mode: 0o600 },
+);
+console.log(JSON.stringify(prepared, null, 2));

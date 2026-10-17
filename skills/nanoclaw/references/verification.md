@@ -34,6 +34,19 @@ Require a successful native response with matching exact IDs. Record the real co
 
 5. For a formal instruction-effectiveness claim, run paired with-skill/no-skill scenario evaluations under create-skill's test workflow. Do not present parser tests or source-string checks as that experiment. For this maintenance task, report precisely which structural, fixture and live read-only checks actually ran.
 
+6. Qualify the companion lifecycle CLI from the plugin checkout (`tools/nanoclaw-run`):
+
+```sh
+bun --no-env-file test
+node --test e2e/tooling.test.mjs
+bun --no-env-file run typecheck
+bun --no-env-file run build
+bun --no-env-file src/cli.ts --help
+bun --no-env-file src/cli.ts --version
+```
+
+Exercise operational JSON and nonzero invalid-input/failed-evidence behavior. Run the real one-instance adapter from `references/run-lifecycle.md`; preserve the first rejected attempt and verify same-group export recovery, native receipt digests and actual proof/image. A fresh proof is not a full security scan. Keep independent code review distinct from these deterministic tests.
+
 ## Exit Criteria
 
 Structure loads through the installed link, all references exist, helper regression tests pass, and live archived-session query succeeds or has an exact blocker. Source diff/commit is available, unrelated changes/running jobs remain untouched, and formal A/B effectiveness is not claimed unless executed.
