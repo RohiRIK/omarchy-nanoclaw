@@ -552,7 +552,11 @@ function nativeTask(s: State, a: Attempt, native: Native): Obj {
       "OWNERSHIP",
       "Native task/session does not match commissioned run",
     );
-  if (!["pending", "paused", "completed"].includes(String(d.status)))
+  if (
+    !["pending", "paused", "completed", "failed", "cancelled"].includes(
+      String(d.status),
+    )
+  )
     throw new RunError("NATIVE_SCHEMA", "Unknown task state");
   if (typeof d.prompt === "string" && digest(d.prompt) !== a.intent.promptSha)
     throw new RunError(
@@ -608,7 +612,7 @@ export function start(
     if (previous?.taskId && previous.sessionId) {
       const d = nativeTask(s, previous, native);
       previous.nativeStatus = String(d.status);
-      if (d.status !== "completed")
+      if (!["completed", "failed", "cancelled"].includes(String(d.status)))
         throw new RunError(
           "IN_FLIGHT",
           "Previous task is not terminal; refuse a duplicate writer",
@@ -806,7 +810,10 @@ export function ingest(
 export function verifyArtifacts(run: string, s: State, a: Attempt): string[] {
   const issues = [...new Set(a.conflicts)];
   if (a.error) issues.push(`native-error:${a.error}`);
-  if (a.nativeStatus !== "completed") issues.push("native-task-not-terminal");
+  if (a.nativeStatus === "failed" || a.nativeStatus === "cancelled")
+    issues.push(`native-task-${a.nativeStatus}`);
+  else if (a.nativeStatus !== "completed")
+    issues.push("native-task-not-terminal");
   const seqs = Object.keys(a.events)
     .map(Number)
     .sort((x, y) => x - y);
@@ -908,7 +915,9 @@ export function inspect(
         s.phase =
           d.status === "completed"
             ? "native-completed-not-verified"
-            : "active-or-scheduled";
+            : d.status === "failed" || d.status === "cancelled"
+              ? `native-${String(d.status)}`
+              : "active-or-scheduled";
       delete a.error;
       save(run, s);
       return summary(s);

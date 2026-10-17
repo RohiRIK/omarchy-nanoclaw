@@ -304,6 +304,29 @@ test("real collect command path explicitly includes archived session ID", () => 
   ).toBe(true);
   expect(result.semanticAcceptance).toBe(false);
 });
+test("failed native execution is terminal failure, never active or accepted even with complete artifacts", () => {
+  const native: Native = (args) => {
+    const d = fake(args);
+    return args[0] === "tasks"
+      ? { ...(d as Record<string, unknown>), status: "failed" }
+      : d;
+  };
+  expect(inspect(run, false, native).phase).toBe("native-failed");
+  const result = inspect(run, true, native);
+  expect(result.phase).toBe("evidence-incomplete");
+  const issues = readState(run).attempts[0]!.issues!;
+  expect(issues).toContain("native-task-failed");
+  expect(issues).not.toContain("native-task-not-terminal");
+  expect(
+    start(
+      run,
+      false,
+      "retry",
+      "actual failed execution prerequisite corrected",
+      native,
+    ).dryRun,
+  ).toBe(true);
+});
 test("native API failure remains an error, not pending or zero findings", () => {
   const native: Native = (args) => {
     if (args[0] === "groups") return fake(args);
