@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# NanoClaw purpose/monitor/recover CLI; source-relative and credential-free.
+set -euo pipefail
+if ! command -v bun >/dev/null 2>&1; then
+  printf '%s\n' '{"ok":false,"error":{"code":"BUN_UNAVAILABLE","message":"Install the supported Bun runtime; no credentials are needed"}}' >&2
+  exit 1
+fi
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(dirname "$(dirname "$SELF")")"
+exec bun --no-env-file "$ROOT/tools/nanoclaw-run/src/cli.ts" "$@"

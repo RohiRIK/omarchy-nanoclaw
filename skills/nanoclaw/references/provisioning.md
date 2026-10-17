@@ -6,6 +6,8 @@ Approved task, exact source revision, canonical repository, native service and a
 
 ## Steps
 
+For a new purpose-bound instance, prefer `references/run-lifecycle.md` and `nanoclaw-run`: it persists commissioning intent, checks evidence and owns bounded recovery. The native commands below remain the platform preflight/diagnostic path, not a reason to create another ad-hoc state machine.
+
 1. Resolve Git registration and the project container before creating copies. Register one task worktree at the approved project layout, with branch/purpose/owner/status in the container index. Keep source snapshots, harness, private receipts and reports beneath that worktree. Distinguish immutable application SHA from harness commits. Record native group/task/session/model/mount/image and scheduler handles in a run-local cleanup index. NanoClaw's native runtime directories stay platform-managed; do not relocate or inspect them. Preserve dirty/unpushed work.
 
 2. Discover the current native command forms, then seed a small supported local template:

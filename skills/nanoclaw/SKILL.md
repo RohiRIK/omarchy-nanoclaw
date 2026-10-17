@@ -1,14 +1,14 @@
 ---
 name: nanoclaw
 description: "Use when operating NanoClaw agents, providers, sessions, tasks, or host integration. Provision and verify through supported host interfaces. NOT FOR application audit methodology or entering containers."
-version: 1.1.0
+version: 1.2.0
 author: Rohi Rikman
 license: MIT
 metadata:
   hermes:
     tags: [nanoclaw, operations, agents, evidence]
     related_skills: [project-worktrees, application-security-audits]
-usage_hint: "Load the matching workflow reference; delegation requires provisioning.md and tasks-and-evidence.md before launch."
+usage_hint: "For purpose/monitor/recover load references/run-lifecycle.md first; use the matching platform reference for native diagnostics."
 ---
 
 # NanoClaw host operations
@@ -19,6 +19,7 @@ Operate from the host. Never enter a Claw container or read/edit its live worksp
 
 | Intent | Reference |
 |---|---|
+| Define a purpose, monitor execution, diagnose and repair a run end-to-end | [Run lifecycle CLI](references/run-lifecycle.md) |
 | Health, channels, terminal chat, containers, desktop and skill links | [Operations](references/operations.md) |
 | Create agents, templates, indexed worktrees, mounts and tool preflight | [Provisioning](references/provisioning.md) |
 | OpenCode free models, OneCLI and provider diagnostics | [Providers](references/providers.md) |

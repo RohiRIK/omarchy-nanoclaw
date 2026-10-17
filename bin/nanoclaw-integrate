@@ -240,14 +240,16 @@ remove_app() {
 }
 
 install_commands() {
-  ask "Put nanoclaw-ctl and NanoClaw's ncl on your PATH (~/.local/bin)?" || return 0
+  ask "Put nanoclaw-ctl, nanoclaw-run and NanoClaw's ncl on your PATH (~/.local/bin)?" || return 0
   link "$PLUGIN_DIR/bin/nanoclaw-ctl" "$BIN/nanoclaw-ctl"
+  link "$PLUGIN_DIR/bin/nanoclaw-run" "$BIN/nanoclaw-run"
   local co="${NANOCLAW_PATH:-$HOME/nanoclaw}"
   [[ -x $co/bin/ncl ]] && link "$co/bin/ncl" "$BIN/ncl" && record "ncl:$co/bin/ncl"
-  record commands; ok "Commands: nanoclaw-ctl$([[ -x $co/bin/ncl ]] && echo ", ncl")"
+  record commands; ok "Commands: nanoclaw-ctl, nanoclaw-run$([[ -x $co/bin/ncl ]] && echo ", ncl")"
 }
 remove_commands() {
   unlink_ours "$BIN/nanoclaw-ctl"
+  unlink_ours "$BIN/nanoclaw-run"
   local r; r="$(grep '^ncl:' "$STATE" 2>/dev/null | head -1)"
   [[ -n $r && -L $BIN/ncl && $(readlink "$BIN/ncl") == "${r#ncl:}" ]] && rm -f "$BIN/ncl" && unrecord "$r"
   unrecord commands; ok "Commands removed"

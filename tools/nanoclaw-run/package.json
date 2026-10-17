@@ -1,0 +1,26 @@
+{
+  "name": "nanoclaw-run",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Evidence-gated purpose, monitoring and recovery over native NanoClaw host interfaces",
+  "bin": {
+    "nanoclaw-run": "./src/cli.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "build": "bun build src/cli.ts --target bun --outfile dist/nanoclaw-run.js",
+    "help": "bun src/cli.ts --help"
+  },
+  "engines": {
+    "bun": ">=1.3.12"
+  },
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {
+    "@types/bun": "1.4.3",
+    "prettier": "3.9.10",
+    "typescript": "7.0.2"
+  }
+}

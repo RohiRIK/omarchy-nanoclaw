@@ -57,6 +57,7 @@ grep -q 'alias ll=' "$H/.bashrc" && grep -q "nanoclaw-default-agent launch --inl
 [[ -f $H/.local/share/applications/rohirik.nanoclaw.desktop && -L $H/.local/share/icons/hicolor/256x256/apps/rohirik.nanoclaw.png ]] \
   && pass "app: desktop entry and icon installed" || fail "app: missing"
 [[ -L $H/.local/bin/nanoclaw-ctl ]] && pass "commands: nanoclaw-ctl linked" || fail "commands: missing"
+[[ -L $H/.local/bin/nanoclaw-run && $(readlink "$H/.local/bin/nanoclaw-run") == "$PLUGIN_DIR/bin/nanoclaw-run" ]] && pass "commands: nanoclaw-run linked to owned wrapper" || fail "commands: lifecycle wrapper missing"
 [[ -L $H/.claude/skills/nanoclaw && $(cat "$H/.codex/skills/nanoclaw/SKILL.md") == "user's own skill" ]] \
   && pass "skill: linked, and a real folder you own was left alone" || fail "skill: wrong"
 ls "$H/.bashrc".bak.rohirik.nanoclaw.* >/dev/null 2>&1 && pass "backups written before edits" || fail "no backups"
@@ -73,6 +74,7 @@ cmp -s "$H/.config/hypr/bindings.lua" "$T/bindings.orig" && pass "remove: bindin
 cmp -s "$H/.bashrc" "$T/bashrc.orig" && pass "remove: bashrc byte-identical" || { fail "remove: bashrc differs"; diff "$T/bashrc.orig" "$H/.bashrc"; }
 [[ ! -e $H/.local/share/applications/rohirik.nanoclaw.desktop && ! -e $H/.local/bin/nanoclaw-ctl && ! -e $H/.claude/skills/nanoclaw ]] \
   && pass "remove: app entry, commands, skill links gone" || fail "remove: leftovers"
+[[ ! -e $H/.local/bin/nanoclaw-run && ! -L $H/.local/bin/nanoclaw-run ]] && pass "remove: lifecycle wrapper gone" || fail "remove: lifecycle wrapper left behind"
 [[ -d $H/.codex/skills/nanoclaw ]] && pass "remove: your own skill folder untouched" || fail "remove: deleted a user folder"
 
 # --- review: never overwrite or delete what is not ours -----------------------
@@ -80,11 +82,13 @@ APPS="$H/.local/share/applications"; D="$APPS/rohirik.nanoclaw.desktop"
 mkdir -p "$APPS" "$H/.local/bin"
 printf '[Desktop Entry]\nName=My own NanoClaw launcher\n' >"$D"
 ln -s /usr/bin/true "$H/.local/bin/nanoclaw-ctl"
+ln -s /usr/bin/true "$H/.local/bin/nanoclaw-run"
 run install app commands --yes
 [[ $(sed -n 2p "$D") == "Name=My own NanoClaw launcher" ]] && pass "app: an existing desktop entry of yours is not overwritten" \
   || fail "app: overwrote the user's desktop entry"
 [[ $(readlink "$H/.local/bin/nanoclaw-ctl") == /usr/bin/true ]] && pass "commands: your own link with the same name is kept" \
   || fail "commands: replaced the user's link"
+[[ $(readlink "$H/.local/bin/nanoclaw-run") == /usr/bin/true ]] && pass "commands: foreign lifecycle wrapper is kept" || fail "commands: replaced foreign lifecycle wrapper"
 run remove app commands --yes
 [[ -f $D && -L $H/.local/bin/nanoclaw-ctl ]] && pass "remove: your desktop entry and link survive" || fail "remove: deleted user files"
 
