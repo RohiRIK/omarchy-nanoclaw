@@ -1,7 +1,7 @@
 ---
 name: nanoclaw
 description: "Use when operating NanoClaw agents, providers, sessions, tasks, or host integration. Provision and verify through supported host interfaces. NOT FOR application audit methodology or entering containers."
-version: 1.2.1
+version: 1.2.2
 author: Rohi Rikman
 license: MIT
 metadata:
@@ -40,6 +40,7 @@ Operate from the host. Never enter a Claw container or read/edit its live worksp
 - Ordinary final task logs may truncate to 500 characters; task-get exposes only a recent tail. Export and collect bounded full artifacts during work.
 - Native API errors are errors, not zero findings or proof a task never ran. Use the read-only `scripts/check-task.py` helper for explicit-handle queries.
 - Discover available models and current pricing; never copy a stale free-model ID, add fake keys, disable OneCLI or fall back to a paid route.
+- Diagnose the installed OpenCode agent with its normal free-model flow before blaming the SDK, changing gateways or requesting keys; follow the CLI-first baseline in the providers reference.
 
 ## Examples
 
