@@ -1,7 +1,7 @@
 ---
 name: nanoclaw
 description: "Use when operating NanoClaw agents, providers, sessions, tasks, or host integration. Provision and verify through supported host interfaces. NOT FOR application audit methodology or entering containers."
-version: 1.2.0
+version: 1.2.1
 author: Rohi Rikman
 license: MIT
 metadata:

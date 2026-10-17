@@ -29,7 +29,7 @@ nanoclaw-run diagnose --run .audit/RUN
 nanoclaw-run verify --run .audit/RUN
 ```
 
-The run retains exact group/task/session commissioning state and raw receipts. Collection queries explicit sessions after archival. Structured exports bind run+attempt+contiguous sequence, strict artifact names, immutable digests and complete-event manifests. Missing reports, native errors, export gaps/conflicts or wrong checks block acceptance even when the task says completed. `evidence-complete` is machine-contract validation, NOT semantic/security certification: inspect the actual proof/screenshot independently.
+The run retains exact group/task/session commissioning state and raw receipts. Collection queries explicit sessions after archival. Structured exports bind run+attempt+contiguous sequence, strict artifact names, immutable digests and complete-event manifests. Use a per-run deterministic publisher for sequence numbers, canonical-byte SHA256 and the nested `complete.data.artifacts` manifest; let the model produce audit results, not hand-write their transport. Require complete scanner output and exit codes (lossless compression is acceptable), not counts/hash-only summaries, and ensure browser-proof references resolve to exported artifacts. Missing reports, native errors, export gaps/conflicts or wrong checks block acceptance even when the task says completed. `evidence-complete` is machine-contract validation, NOT semantic/security certification: inspect the actual proof/screenshot independently.
 
 4. Recover concrete problems, preserving attempts and the SAME instance:
 
